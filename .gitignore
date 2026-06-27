@@ -1,0 +1,32 @@
+# External repositories
+freqtrade/
+ai-lab/
+
+# Runtime
+logs/
+reports/
+data/
+archive/
+backups/
+experiments/
+workspace/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtualenv
+.venv/
+venv/
+
+# Models
+models/
+
+# OpenCode
+.opencode/
+
+# Secrets
+.env
+*.key
+*.pem
