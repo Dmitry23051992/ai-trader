@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
 import time
+from datetime import datetime
 
 from configs.settings import START_DATE, SYMBOLS, TIMEFRAMES
 
@@ -10,9 +10,7 @@ from .storage import CandleStorage
 
 
 class MarketCollector:
-
     def __init__(self):
-
         self.exchange = ExchangeClient()
         self.storage = CandleStorage()
 
@@ -38,52 +36,64 @@ class MarketCollector:
 
             print(f"[{symbol}][{timeframe}] UPDATE")
 
-        inserted = 0
+        total = 0
 
         while True:
 
-            candles = self.exchange.fetch(
+            candles = self.exchange.fetch_page(
                 symbol=symbol,
                 timeframe=timeframe,
                 since=since,
-                limit=1000,
             )
 
             if not candles:
                 break
 
-            rows = []
+rows = []
 
-            for c in candles:
+last_db = self.storage.last_timestamp(symbol, timeframe)
 
+for c in candles:
+
+    if last_db is not None and c[0] <= last_db:
+        continue
                 rows.append(
                     (
                         symbol,
                         timeframe,
-                        c[0],
-                        datetime.utcfromtimestamp(c[0] / 1000),
-                        c[1],
-                        c[2],
-                        c[3],
-                        c[4],
-                        c[5],
+                        candle[0],
+                        datetime.utcfromtimestamp(candle[0] / 1000),
+                        candle[1],
+                        candle[2],
+                        candle[3],
+                        candle[4],
+                        candle[5],
                     )
                 )
 
-            self.storage.insert(rows)
+inserted = self.storage.insert(rows)
 
-            inserted += len(rows)
+total += inserted
 
-            print(
-                f"[{symbol}][{timeframe}] +{len(rows)} candles (total {inserted})"
-            )
+print(
+    f"[{symbol}][{timeframe}] "
+    f"Fetched={len(candles)} "
+    f"New={len(rows)} "
+    f"Inserted={inserted} "
+    f"Total={total}"
+)            )
 
-            since = candles[-1][0] + 1
+            last_timestamp = candles[-1][0]
+
+            if last_timestamp <= since:
+                break
+
+            since = last_timestamp + 1
 
             if len(candles) < 1000:
                 break
 
-            time.sleep(self.exchange.exchange.rateLimit / 1000)
+            time.sleep(0.2)
 
         print(f"[{symbol}][{timeframe}] DONE")
 
@@ -93,15 +103,23 @@ class MarketCollector:
 
             for timeframe in TIMEFRAMES:
 
-                self.collect_symbol(symbol, timeframe)
+                self.collect_symbol(
+                    symbol,
+                    timeframe,
+                )
 
         print()
-
+        print("=" * 60)
         print("Database candles:", self.storage.count())
+        print("=" * 60)
 
         self.storage.close()
 
 
-if __name__ == "__main__":
+def main():
+    collector = MarketCollector()
+    collector.run()
 
-    MarketCollector().run()
+
+if __name__ == "__main__":
+    main()

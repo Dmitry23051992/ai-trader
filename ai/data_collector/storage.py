@@ -8,9 +8,7 @@ from configs.settings import DB_PATH
 class CandleStorage:
 
     def __init__(self):
-
         self.db = duckdb.connect(str(DB_PATH))
-
         self.create()
 
     def create(self):
@@ -20,21 +18,14 @@ class CandleStorage:
             CREATE TABLE IF NOT EXISTS candles(
 
                 symbol VARCHAR,
-
                 timeframe VARCHAR,
-
                 timestamp BIGINT,
-
                 datetime TIMESTAMP,
 
                 open DOUBLE,
-
                 high DOUBLE,
-
                 low DOUBLE,
-
                 close DOUBLE,
-
                 volume DOUBLE,
 
                 PRIMARY KEY(symbol,timeframe,timestamp)
@@ -48,11 +39,8 @@ class CandleStorage:
         row = self.db.execute(
             """
             SELECT MAX(timestamp)
-
             FROM candles
-
             WHERE symbol=?
-
             AND timeframe=?
             """,
             [symbol, timeframe],
@@ -62,6 +50,9 @@ class CandleStorage:
 
     def insert(self, rows):
 
+        if not rows:
+            return 0
+
         self.db.executemany(
             """
             INSERT OR IGNORE INTO candles
@@ -70,6 +61,8 @@ class CandleStorage:
             rows,
         )
 
+        return len(rows)
+
     def count(self):
 
         return self.db.execute(
@@ -77,5 +70,4 @@ class CandleStorage:
         ).fetchone()[0]
 
     def close(self):
-
         self.db.close()

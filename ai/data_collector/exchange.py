@@ -4,7 +4,11 @@ import time
 
 import ccxt
 
-from configs.settings import EXCHANGE
+from configs.settings import (
+    DOWNLOAD_LIMIT,
+    EXCHANGE,
+    REQUEST_DELAY,
+)
 
 
 class ExchangeClient:
@@ -21,32 +25,30 @@ class ExchangeClient:
 
         self.exchange.load_markets()
 
-    def fetch(
+    def fetch_page(
         self,
         symbol: str,
         timeframe: str,
-        since: int | None = None,
-        limit: int = 1000,
-        retries: int = 5,
+        since: int,
     ):
 
-        last_error = None
-
-        for _ in range(retries):
+        while True:
 
             try:
 
-                return self.exchange.fetch_ohlcv(
+                data = self.exchange.fetch_ohlcv(
                     symbol=symbol,
                     timeframe=timeframe,
                     since=since,
-                    limit=limit,
+                    limit=DOWNLOAD_LIMIT,
                 )
+
+                time.sleep(REQUEST_DELAY)
+
+                return data
 
             except Exception as e:
 
-                last_error = e
+                print(e)
 
-                time.sleep(2)
-
-        raise last_error
+                time.sleep(5)
