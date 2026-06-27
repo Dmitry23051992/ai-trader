@@ -1,75 +1,107 @@
+from __future__ import annotations
+
+from datetime import datetime
 import time
 
-import ccxt
+from configs.settings import START_DATE, SYMBOLS, TIMEFRAMES
+
+from .exchange import ExchangeClient
+from .storage import CandleStorage
 
 
-class ExchangeCollector:
+class MarketCollector:
 
     def __init__(self):
 
-        self.exchange = ccxt.binance({
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "spot"
-            }
-        })
+        self.exchange = ExchangeClient()
+        self.storage = CandleStorage()
 
-    def fetch(
+    def collect_symbol(
         self,
-        symbol,
-        timeframe,
-        since=None,
-        limit=1000
+        symbol: str,
+        timeframe: str,
     ):
+
+        since = self.storage.last_timestamp(symbol, timeframe)
+
+        if since is None:
+
+            since = int(
+                datetime.fromisoformat(START_DATE).timestamp() * 1000
+            )
+
+            print(f"[{symbol}][{timeframe}] FULL DOWNLOAD")
+
+        else:
+
+            since += 1
+
+            print(f"[{symbol}][{timeframe}] UPDATE")
+
+        inserted = 0
 
         while True:
 
-            try:
-
-                return self.exchange.fetch_ohlcv(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    since=since,
-                    limit=limit
-                )
-
-            except Exception as e:
-
-                print(e)
-
-                time.sleep(5)
-
-    def fetch_all(
-        self,
-        symbol,
-        timeframe,
-        since=None,
-        limit=1000
-    ):
-
-        total = 0
-
-        while True:
-
-            candles = self.fetch(
-                symbol,
-                timeframe,
-                since,
-                limit
+            candles = self.exchange.fetch(
+                symbol=symbol,
+                timeframe=timeframe,
+                since=since,
+                limit=1000,
             )
 
             if not candles:
-
                 break
 
-            yield candles
+            rows = []
 
-            total += len(candles)
+            for c in candles:
 
-            print(f"Downloaded {total:,} candles")
+                rows.append(
+                    (
+                        symbol,
+                        timeframe,
+                        c[0],
+                        datetime.utcfromtimestamp(c[0] / 1000),
+                        c[1],
+                        c[2],
+                        c[3],
+                        c[4],
+                        c[5],
+                    )
+                )
 
-            if len(candles) < limit:
+            self.storage.insert(rows)
 
-                break
+            inserted += len(rows)
+
+            print(
+                f"[{symbol}][{timeframe}] +{len(rows)} candles (total {inserted})"
+            )
 
             since = candles[-1][0] + 1
+
+            if len(candles) < 1000:
+                break
+
+            time.sleep(self.exchange.exchange.rateLimit / 1000)
+
+        print(f"[{symbol}][{timeframe}] DONE")
+
+    def run(self):
+
+        for symbol in SYMBOLS:
+
+            for timeframe in TIMEFRAMES:
+
+                self.collect_symbol(symbol, timeframe)
+
+        print()
+
+        print("Database candles:", self.storage.count())
+
+        self.storage.close()
+
+
+if __name__ == "__main__":
+
+    MarketCollector().run()
