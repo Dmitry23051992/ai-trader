@@ -31,3 +31,4 @@ ai/dataset/csv/
 # Freqtrade
 freqtrade/user_data/backtest_results/
 freqtrade/user_data/logs/
+freqtrade/
