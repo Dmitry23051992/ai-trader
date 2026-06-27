@@ -1,32 +1,33 @@
-# External repositories
-freqtrade/
-ai-lab/
-
-# Runtime
-logs/
-reports/
-data/
-archive/
-backups/
-experiments/
-workspace/
-
 # Python
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-
-# Virtualenv
-.venv/
-venv/
-
-# Models
-models/
-
-# OpenCode
-.opencode/
 
 # Secrets
 .env
-*.key
-*.pem
+.env.*
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# DuckDB
+*.wal
+
+#Opencode
+.opencode/
+
+#Database
+ai/database/
+
+# Local data
+ai/database/*.duckdb
+ai/dataset/archive/
+ai/dataset/csv/
+
+# Freqtrade
+freqtrade/user_data/backtest_results/
+freqtrade/user_data/logs/

@@ -1,0 +1,16 @@
+llm:
+  provider: openrouter
+  model: openai/gpt-oss-20b:free
+
+project:
+  root: /home/user/ai-trader
+
+freqtrade:
+  strategy_dir: /home/user/ai-trader/freqtrade/user_data/strategies
+  backtest_script: /home/user/ai-trader/automation/backtest.sh
+
+git:
+  auto_commit: true
+
+loop:
+  max_iterations: 20
