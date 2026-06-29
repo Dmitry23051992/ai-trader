@@ -1,10 +1,8 @@
-from ai.data_collector.history import HistoryCollector
+from ai.data_collector.collector import MarketCollector
 
 
 def main():
-
-    collector = HistoryCollector()
-
+    collector = MarketCollector()
     collector.run()
 
 
