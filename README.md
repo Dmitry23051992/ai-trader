@@ -1,5 +1,9 @@
 # 🤖 AI Trader
 
+![License](https://img.shields.io/badge/license-MIT-blue)
+[![CI](https://github.com/Dmitry23051992/ai-trader/actions/workflows/ci.yml/badge.svg?branch=develop)](https://github.com/Dmitry23051992/ai-trader/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.11%20|%203.12-blue)
+
 **Автономная AI-система для разработки, тестирования и исполнения торговых стратегий на Binance через Freqtrade.**
 
 Система работает в двух режимах, которые можно использовать независимо или вместе:
@@ -338,6 +342,10 @@ ai-trader/
 
 ---
 
+## 🤝 Вклад в проект
+
+Хотите помочь? Смотрите [CONTRIBUTING.md](CONTRIBUTING.md) — там описаны правила, процесс создания PR и как запускать проверки.
+
 ## 📄 Лицензия
 
-MIT
+MIT — см. [LICENSE](LICENSE).
