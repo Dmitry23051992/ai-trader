@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=user
 WorkingDirectory=/home/user/ai-trader
+Environment=AI_USE_COUNCIL=true
 ExecStart=/usr/bin/python3 /home/user/ai-trader/ai_agent.py --daemon
 Restart=on-failure
 RestartSec=30

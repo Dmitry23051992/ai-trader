@@ -38,6 +38,14 @@ BASE64_CRED = base64_creds = __import__("base64").b64encode(
     f"{FREQTRADE_USER}:{FREQTRADE_PASS}".encode()
 ).decode()
 
+# ── Журнал решений AI ────────────────────────────────────────
+DECISION_LOG_PATH = Path("/home/user/ai-trader/freqtrade/user_data/ai_decision_log.jsonl")
+MAX_HISTORY_DAYS = 14  # сколько дней хранить историю решений
+
+# ── Multi-LLM совет ─────────────────────────────────────────
+# Включить/выключить совет директоров (3 голоса: бык, медведь, стратег)
+USE_COUNCIL = os.getenv("AI_USE_COUNCIL", "true").lower() in ("true", "1", "yes")
+
 
 # ── Утилиты ──────────────────────────────────────────────────
 
@@ -280,9 +288,488 @@ def collect_market_data() -> dict:
     }
 
 
+# ── Журнал решений AI ──────────────────────────────────────
+
+def log_decision(params: dict, market_data: dict) -> str:
+    """Записать решение AI в лог для последующей оценки.
+
+    Сохраняет: timestamp, принятые параметры, снапшот рынка (баланс, открытые сделки).
+    Возвращает decision_id для отслеживания.
+    """
+    import uuid
+    decision_id = str(uuid.uuid4())[:8]
+    entry = {
+        "_decision_id": decision_id,
+        "timestamp": datetime.now().isoformat(),
+        "params": {
+            "market_regime": params.get("market_regime"),
+            "ai_signal": params.get("ai_signal"),
+            "stoploss": params.get("stoploss"),
+            "position_size_pct": params.get("position_size_pct"),
+            "confidence_threshold": params.get("confidence_threshold"),
+            "recommended_pairs": params.get("recommended_pairs", []),
+            "avoid_pairs": params.get("avoid_pairs", []),
+            "action": params.get("action"),
+        },
+        "market_snapshot": {
+            "total_usdt": market_data.get("balance", {}).get("total_usdt", 0),
+            "free_usdt": market_data.get("balance", {}).get("free_usdt", 0),
+            "profit_pct": market_data.get("balance", {}).get("profit_pct", 0),
+            "open_trades_count": len(market_data.get("open_trades", [])),
+            "open_trades_pairs": [t["pair"] for t in market_data.get("open_trades", [])],
+        },
+        "outcome": None,  # будет заполнен позже evaluate_decision_log
+    }
+
+    try:
+        DECISION_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(DECISION_LOG_PATH, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log(f"📝 Decision {decision_id} logged")
+    except Exception as e:
+        log(f"⚠️  Could not write decision log: {e}")
+
+    return decision_id
+
+
+def evaluate_decision_log() -> dict:
+    """Анализировать историю решений AI: какие рекомендации дали профит, какие — убыток.
+
+    Читает лог решений и закрытые сделки из Freqtrade API,
+    сопоставляет их по времени и вычисляет метрики качества.
+    """
+    import json as j
+
+    if not DECISION_LOG_PATH.exists():
+        return {}
+
+    # Читаем лог решений
+    decisions = []
+    with open(DECISION_LOG_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    decisions.append(j.loads(line))
+                except Exception:
+                    continue
+
+    if not decisions:
+        return {}
+
+    # Фильтруем последние MAX_HISTORY_DAYS
+    cutoff = time.time() - MAX_HISTORY_DAYS * 86400
+    recent = []
+    for d in decisions:
+        try:
+            ts = datetime.fromisoformat(d["timestamp"]).timestamp()
+            if ts >= cutoff:
+                recent.append(d)
+        except Exception:
+            continue
+
+    if not recent:
+        return {}
+
+    # Получаем закрытые сделки
+    trades_data = api_get("/api/v1/trades?limit=100") or {"trades": []}
+    closed_trades = [t for t in trades_data.get("trades", []) if not t.get("is_open", True)]
+
+    # Сопоставляем: для каждой закрытой сделки находим решение AI,
+    # которое было активно на момент входа
+    matched_trades = []
+    for trade in closed_trades:
+        try:
+            open_timestamp = datetime.fromisoformat(trade["open_date"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            continue
+
+        # Ищем решение, принятое незадолго до входа в сделку (в пределах 6 часов)
+        best_decision = None
+        best_diff = float("inf")
+        for d in recent:
+            try:
+                dt = datetime.fromisoformat(d["timestamp"]).timestamp()
+                diff = open_timestamp - dt
+                if 0 <= diff <= 6 * 3600 and diff < best_diff:
+                    best_decision = d
+                    best_diff = diff
+            except Exception:
+                continue
+
+        if best_decision:
+            matched_trades.append({
+                "pair": trade.get("pair", ""),
+                "profit_pct": trade.get("profit_pct", 0),
+                "profit_abs": trade.get("profit_abs", 0),
+                "exit_reason": trade.get("exit_reason", "?"),
+                "open_date": trade.get("open_date", ""),
+                "decision_params": best_decision.get("params", {}),
+                "decision_timestamp": best_decision.get("timestamp", ""),
+            })
+
+    # Вычисляем метрики
+    metrics = {}
+
+    # 1. Winrate по ai_signal
+    for signal in ["buy", "hold", "sell"]:
+        trades_with_signal = [t for t in matched_trades if t["decision_params"].get("ai_signal") == signal]
+        if trades_with_signal:
+            wins = sum(1 for t in trades_with_signal if t["profit_pct"] > 0)
+            avg_profit = sum(t["profit_pct"] for t in trades_with_signal) / len(trades_with_signal)
+            metrics[f"winrate_signal_{signal}"] = {
+                "trades": len(trades_with_signal),
+                "wins": wins,
+                "winrate_pct": round(wins / len(trades_with_signal) * 100, 1),
+                "avg_profit_pct": round(avg_profit, 2),
+                "total_profit_pct": round(sum(t["profit_pct"] for t in trades_with_signal), 2),
+            }
+
+    # 2. Winrate по regime
+    for regime in ["bullish", "neutral", "bearish", "panic"]:
+        trades_with_regime = [t for t in matched_trades if t["decision_params"].get("market_regime") == regime]
+        if trades_with_regime:
+            wins = sum(1 for t in trades_with_regime if t["profit_pct"] > 0)
+            avg_profit = sum(t["profit_pct"] for t in trades_with_regime) / len(trades_with_regime)
+            metrics[f"winrate_regime_{regime}"] = {
+                "trades": len(trades_with_regime),
+                "wins": wins,
+                "winrate_pct": round(wins / len(trades_with_regime) * 100, 1),
+                "avg_profit_pct": round(avg_profit, 2),
+            }
+
+    # 3. Эффективность recommended_pairs
+    rec_pair_outcomes = {}
+    for t in matched_trades:
+        rec_pairs = t["decision_params"].get("recommended_pairs", [])
+        pair = t["pair"]
+        if pair not in rec_pair_outcomes:
+            rec_pair_outcomes[pair] = {"recommended_as_top": 0, "not_recommended": 0, "profit_sum": 0.0, "trades": 0}
+        rec_pair_outcomes[pair]["trades"] += 1
+        rec_pair_outcomes[pair]["profit_sum"] += t["profit_pct"]
+        if pair in rec_pairs:
+            rec_pair_outcomes[pair]["recommended_as_top"] += 1
+        else:
+            rec_pair_outcomes[pair]["not_recommended"] += 1
+
+    metrics["pair_recommendation_effectiveness"] = rec_pair_outcomes
+
+    # 4. Общие метрики
+    if matched_trades:
+        all_wins = sum(1 for t in matched_trades if t["profit_pct"] > 0)
+        metrics["overall"] = {
+            "total_trades_evaluated": len(matched_trades),
+            "total_wins": all_wins,
+            "overall_winrate_pct": round(all_wins / len(matched_trades) * 100, 1),
+            "total_profit_pct": round(sum(t["profit_pct"] for t in matched_trades), 2),
+            "avg_profit_pct": round(sum(t["profit_pct"] for t in matched_trades) / len(matched_trades), 2),
+            "best_trade_pct": round(max(t["profit_pct"] for t in matched_trades), 2),
+            "worst_trade_pct": round(min(t["profit_pct"] for t in matched_trades), 2),
+        }
+
+    # Обновляем лог: помечаем у каких решений есть outcome
+    _update_decision_outcomes(matched_trades, recent)
+
+    log(f"📊 Decision evaluation: {metrics.get('overall', {}).get('total_trades_evaluated', 0)} trades matched "
+        f"to {len(recent)} decisions. "
+        f"Winrate: {metrics.get('overall', {}).get('overall_winrate_pct', '?')}%")
+
+    return metrics
+
+
+def _update_decision_outcomes(matched_trades: list, decisions: list):
+    """Обновить лог решений: добавить outcome для решений, по которым были сделки."""
+    try:
+        lines = []
+        updated_count = 0
+        with open(DECISION_LOG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    # Ищем сделки, соответствующие этому решению
+                    dec_ts = entry.get("timestamp", "")
+                    matching_trades = [
+                        t for t in matched_trades
+                        if t.get("decision_timestamp") == dec_ts
+                    ]
+                    if matching_trades:
+                        profits = [t["profit_pct"] for t in matching_trades]
+                        entry["outcome"] = {
+                            "trades_count": len(matching_trades),
+                            "avg_profit_pct": round(sum(profits) / len(profits), 2),
+                            "total_profit_pct": round(sum(profits), 2),
+                            "wins": sum(1 for p in profits if p > 0),
+                            "pairs": [t["pair"] for t in matching_trades],
+                        }
+                        updated_count += 1
+                    lines.append(json.dumps(entry))
+                except Exception:
+                    lines.append(line)
+
+        with open(DECISION_LOG_PATH, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        if updated_count:
+            log(f"📝 Updated {updated_count} decisions with outcomes")
+    except Exception as e:
+        log(f"⚠️  Could not update outcomes: {e}")
+
+
+def build_feedback_section(evaluation: dict) -> str:
+    """Сформировать секцию feedback для промпта — как сработали прошлые рекомендации AI."""
+    if not evaluation:
+        return ""
+
+    parts = ["=== ОЦЕНКА ПРЕДЫДУЩИХ РЕШЕНИЙ AI ==="]
+
+    overall = evaluation.get("overall", {})
+    if overall:
+        parts.append(
+            f"Всего оценено сделок: {overall.get('total_trades_evaluated', 0)} | "
+            f"Winrate: {overall.get('overall_winrate_pct', '?')}% | "
+            f"Общий P&L: {overall.get('total_profit_pct', 0):+.2f}% | "
+            f"Средняя сделка: {overall.get('avg_profit_pct', 0):+.2f}%"
+        )
+        parts.append(
+            f"Лучшая: {overall.get('best_trade_pct', 0):+.2f}% | "
+            f"Худшая: {overall.get('worst_trade_pct', 0):+.2f}%"
+        )
+
+    # Winrate по сигналам
+    signal_lines = []
+    for signal in ["buy", "hold", "sell"]:
+        key = f"winrate_signal_{signal}"
+        if key in evaluation:
+            s = evaluation[key]
+            signal_lines.append(
+                f"  ai_signal={signal}: {s['trades']} сделок, "
+                f"winrate={s['winrate_pct']}%, "
+                f"средняя={s['avg_profit_pct']:+.2f}%"
+            )
+    if signal_lines:
+        parts.append("По сигналам:")
+        parts.extend(signal_lines)
+
+    # Winrate по режиму
+    regime_lines = []
+    for regime in ["bullish", "neutral", "bearish", "panic"]:
+        key = f"winrate_regime_{regime}"
+        if key in evaluation:
+            r = evaluation[key]
+            regime_lines.append(
+                f"  regime={regime}: {r['trades']} сделок, "
+                f"winrate={r['winrate_pct']}%, "
+                f"средняя={r['avg_profit_pct']:+.2f}%"
+            )
+    if regime_lines:
+        parts.append("По режимам рынка:")
+        parts.extend(regime_lines)
+
+    # Эффективность рекомендованных пар
+    pair_eff = evaluation.get("pair_recommendation_effectiveness", {})
+    if pair_eff:
+        best_rec = []
+        worst_missed = []
+        for pair, stats in pair_eff.items():
+            total = stats["trades"]
+            if total >= 2:
+                if stats["recommended_as_top"] > 0 and stats["profit_sum"] > 0:
+                    best_rec.append((pair, stats["profit_sum"] / total))
+                elif stats["not_recommended"] > 0 and stats["profit_sum"] > 5:
+                    worst_missed.append((pair, stats["profit_sum"] / total))
+
+        if best_rec:
+            best_rec.sort(key=lambda x: x[1], reverse=True)
+            parts.append("Лучшие рекомендованные пары: " +
+                         ", ".join(f"{p} ({v:+.2f}%/сд)" for p, v in best_rec[:3]))
+        if worst_missed:
+            worst_missed.sort(key=lambda x: x[1], reverse=True)
+            parts.append("⚠️ Пропущенный профит (не рекомендовал, но пара выросла): " +
+                         ", ".join(f"{p} ({v:+.2f}%/сд)" for p, v in worst_missed[:3]))
+
+    parts.append("")
+    return "\n".join(parts)
+
+
+# ── Multi-LLM Совет Директоров ─────────────────────────────
+
+def _council_persona(name: str, instruction: str) -> str:
+    """Сформировать system prompt для одного советника."""
+    return f"""Ты — {name} в совете AI-трейдеров. Твоя задача — анализировать рынок с точки зрения {name.lower()}.
+
+{instruction}
+
+Отвечай ТОЛЬКО в JSON-формате:
+{{
+  "market_regime": "bullish" | "neutral" | "bearish" | "panic",
+  "ai_signal": "buy" | "sell" | "hold",
+  "confidence_threshold": 0.0-1.0,
+  "position_size_pct": 0.0-1.0,
+  "stoploss_recommendation": -0.01 to -0.08,
+  "reasoning": "твоё обоснование (1 предложение)"
+}}"""
+
+
+def _aggregate_council_votes(responses: list[dict]) -> dict:
+    """Усреднить голоса совета в единую рекомендацию.
+
+    Использует взвешенное голосование:
+    - buy = +1, hold = 0, sell = -1
+    - regime: числовое представление + усреднение
+    - position_size, confidence, stoploss: медианное значение
+    """
+    if not responses:
+        return {}
+
+    # Голосование по ai_signal
+    signal_map = {"buy": 1, "hold": 0, "sell": -1}
+    inv_signal = {1: "buy", 0: "hold", -1: "sell"}
+
+    votes = []
+    regime_scores = {"bullish": 2, "neutral": 1, "bearish": -1, "panic": -2}
+    inv_regime = {2: "bullish", 1: "neutral", -1: "bearish", -2: "panic"}
+
+    for r in responses:
+        sig = r.get("ai_signal", "hold")
+        votes.append(signal_map.get(sig, 0))
+
+        reg = r.get("market_regime", "neutral")
+        regime_scores.setdefault(reg, 0)
+
+    avg_vote = sum(votes) / len(votes)
+    final_signal = inv_signal.get(1 if avg_vote > 0.3 else (-1 if avg_vote < -0.3 else 0), "hold")
+
+    # Режим — тоже голосование
+    reg_votes = []
+    for r in responses:
+        reg = r.get("market_regime", "neutral")
+        reg_votes.append(regime_scores.get(reg, 0))
+    avg_reg = sum(reg_votes) / len(reg_votes) if reg_votes else 1
+    # Ищем ближайший режим
+    final_regime = min(inv_regime.keys(), key=lambda k: abs(k - avg_reg))
+    final_regime = inv_regime[final_regime]
+
+    # Медианные/средние значения
+    sizes = [float(r.get("position_size_pct", 0.5)) for r in responses if r.get("position_size_pct") is not None]
+    confs = [float(r.get("confidence_threshold", 0.5)) for r in responses if r.get("confidence_threshold") is not None]
+    sls = [float(r.get("stoploss_recommendation", -0.035)) for r in responses if r.get("stoploss_recommendation") is not None]
+
+    def median(arr):
+        s = sorted(arr)
+        return s[len(s) // 2] if s else 0.5
+
+    # Собираем аргументы для отчёта
+    all_reasoning = []
+    for i, r in enumerate(responses):
+        reason = r.get("reasoning", "")
+        if reason:
+            all_reasoning.append(f"Советник {i+1}: {reason}")
+
+    return {
+        "market_regime": final_regime,
+        "ai_signal": final_signal,
+        "position_size_pct": max(0.5, min(1.0, median(sizes))),
+        "confidence_threshold": max(0.2, min(0.6, median(confs))),
+        "stoploss_recommendation": max(-0.08, min(-0.01, median(sls))),
+        "reasoning": " | ".join(all_reasoning) if all_reasoning else "Консенсус совета директоров",
+        "_votes": {
+            "buy": sum(1 for v in votes if v == 1),
+            "hold": sum(1 for v in votes if v == 0),
+            "sell": sum(1 for v in votes if v == -1),
+            "avg_vote": round(avg_vote, 2),
+        },
+    }
+
+
+def ollama_council(market_summary: str, full_context: str, feedback: str = "") -> dict:
+    """Запустить совет директоров: несколько LLM-запросов с разными ролями.
+
+    Args:
+        market_summary: сводка рынка (user prompt)
+        full_context: полный system prompt (уже содержит feedback если есть)
+        feedback: отдельно feedback для логирования
+
+    Возвращает агрегированную рекомендацию.
+    """
+    personas = [
+        {
+            "name": "Бычий аналитик",
+            "instruction": "Твоя специализация — находить возможности для покупки. "
+                          "Ты ищешь сильные тренды, растущий объём, бычьи паттерны. "
+                          "Ты склонен рекомендовать buy, если нет явных признаков катастрофы. "
+                          "Твой девиз: «Растущий рынок приносит деньги». "
+                          "Если рынок падает — ты ищешь точки разворота."
+        },
+        {
+            "name": "Медвежий аналитик",
+            "instruction": "Твоя специализация — управление рисками и защита капитала. "
+                          "Ты ищешь признаки перегрева, падающий объём, медвежьи дивергенции. "
+                          "Ты склонен рекомендовать hold или sell. "
+                          "Твой девиз: «Сохранить капитал важнее, чем заработать». "
+                          "Даже на растущем рынке ты ищешь подтверждения."
+        },
+        {
+            "name": "Главный стратег",
+            "instruction": "Твоя задача — сбалансировать риск и доходность. "
+                          "Ты анализируешь общую картину: баланс бота, P&L, количество открытых сделок. "
+                          "Ты принимаешь решение на основе фактов, а не эмоций. "
+                          "Ты — голос разума между быками и медведями."
+        },
+    ]
+
+    log(f"🏛️  Council of {len(personas)} advisors convening...")
+    responses = []
+
+    for i, persona in enumerate(personas):
+        persona_system = _council_persona(persona["name"], persona["instruction"])
+        # Объединяем роль советника с полным контекстом (уже включает feedback)
+        full_system = persona_system + "\n\n" + full_context
+
+        log(f"  Consulting {persona['name']}...")
+        response = ollama_chat(market_summary, system=full_system)
+
+        if response:
+            parsed = _parse_llm_json(response)
+            if parsed:
+                parsed["_persona"] = persona["name"]
+                responses.append(parsed)
+                log(f"    → {persona['name']}: signal={parsed.get('ai_signal')}, "
+                    f"regime={parsed.get('market_regime')}")
+            else:
+                log(f"    ⚠️  {persona['name']}: could not parse JSON response")
+        else:
+            log(f"    ⚠️  {persona['name']}: no response")
+
+    if not responses:
+        log("⚠️  Council returned no valid responses — falling back to single LLM")
+        response = ollama_chat(market_summary, system=full_context)
+        return _parse_llm_json(response) or {}
+
+    aggregated = _aggregate_council_votes(responses)
+    log(f"🏛️  Council consensus: signal={aggregated.get('ai_signal')}, "
+        f"regime={aggregated.get('market_regime')}, "
+        f"votes={aggregated.get('_votes', {})}")
+    return aggregated
+
+
+def _parse_llm_json(text: str) -> dict | None:
+    """Извлечь JSON из ответа LLM."""
+    try:
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            return json.loads(text[start:end])
+    except Exception:
+        return None
+    return None
+
+
 # ── Формирование промпта ────────────────────────────────────
 
-def build_market_prompt(data: dict, candle_data: dict = None) -> tuple[str, str]:
+def build_market_prompt(data: dict, candle_data: dict = None, feedback: str = "") -> tuple[str, str]:
     """Сформировать system-промпт и user-запрос для LLM."""
 
     system = """Ты — AI-трейдер-аналитик. Твоя задача — анализировать рынок криптовалют и давать рекомендации для торгового бота Freqtrade.
@@ -451,14 +938,26 @@ def update_ai_params(llm_response: str, market_data: dict) -> bool:
         if "action" in rec:
             params["action"] = rec["action"]
 
+        # Сохраняем результаты голосования совета (если есть)
+        if "_votes" in rec:
+            params["_council_votes"] = rec["_votes"]
+        if "_persona" in rec:
+            params["_council_persona"] = rec["_persona"]
+
         params["_updated_at"] = datetime.now().isoformat()
-        params["_version"] = 4
+        params["_version"] = 5
 
         with open(AI_PARAMS_PATH, "w") as f:
             json.dump(params, f, indent=2)
 
+        # Логируем решение для последующей оценки
+        decision_id = log_decision(params, market_data)
+        params["_decision_id"] = decision_id
+
         log(f"✅ AI params updated: regime={params.get('market_regime')}, "
-            f"sl={params.get('stoploss')}, size={params.get('position_size_pct')}")
+            f"signal={params.get('ai_signal')}, "
+            f"sl={params.get('stoploss')}, size={params.get('position_size_pct')}, "
+            f"decision={decision_id}")
         return True
 
     except json.JSONDecodeError as e:
@@ -473,7 +972,7 @@ def update_ai_params(llm_response: str, market_data: dict) -> bool:
 # ── Основной цикл ────────────────────────────────────────────
 
 def run_analysis():
-    """Один полный цикл анализа."""
+    """Один полный цикл анализа с оценкой прошлых решений и советом директоров."""
     log("=" * 50)
     log("Starting market analysis...")
 
@@ -486,14 +985,47 @@ def run_analysis():
     # Собираем свечные данные с Binance
     candle_data = collect_candle_data(data["whitelist"])
 
+    # ── Оценка предыдущих решений ──────────────────────────
+    log("📊 Evaluating past AI decisions...")
+    evaluation = evaluate_decision_log()
+    feedback = build_feedback_section(evaluation)
+    if feedback:
+        log(f"📋 Feedback built ({len(feedback)} chars):")
+        for line in feedback.split("\n")[:5]:
+            if line.strip():
+                log(f"  {line.strip()}")
+
+    # ── Формируем промпт ───────────────────────────────────
     system_prompt, market_summary = build_market_prompt(data, candle_data)
 
-    log("Sending to Ollama for analysis...")
-    response = ollama_chat(market_summary, system=system_prompt)
+    # Добавляем feedback в начало system prompt (если есть)
+    if feedback:
+        system_prompt = feedback + "\n\n" + system_prompt
 
-    if not response:
-        log("⚠️  No response from Ollama")
-        return False
+    # ── Multi-LLM Совет Директоров ─────────────────────────
+    if USE_COUNCIL:
+        log("🏛️  Convening AI trading council...")
+        council_result = ollama_council(market_summary, system_prompt, feedback)
+
+        if council_result:
+            # Сериализуем результат совета в JSON для update_ai_params
+            response = json.dumps(council_result, ensure_ascii=False)
+            log(f"🏛️  Council decision: signal={council_result.get('ai_signal')}, "
+                f"regime={council_result.get('market_regime')}, "
+                f"size={council_result.get('position_size_pct')}")
+        else:
+            log("⚠️  Council failed — falling back to single LLM")
+            response = ollama_chat(market_summary, system=system_prompt)
+            if not response:
+                log("⚠️  No response from Ollama")
+                return False
+    else:
+        # Режим одного советника (без совета)
+        log("Sending to Ollama for analysis (single advisor)...")
+        response = ollama_chat(market_summary, system=system_prompt)
+        if not response:
+            log("⚠️  No response from Ollama")
+            return False
 
     log(f"LLM response received ({len(response)} chars)")
 
