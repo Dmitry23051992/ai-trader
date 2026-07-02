@@ -1039,22 +1039,30 @@ def sleep_until_next_candle():
     Таймфрейм 15m → свечи закрываются в :00/:15/:30/:45.
     Запускаем анализ в :02/:17/:32/:47 — даём время данным обновиться.
     """
-    now = time.time()
-    local = time.localtime(now)
-    minutes = local.tm_min
-    seconds = local.tm_sec
+    import datetime as dt
 
-    # Следующее время запуска: (:02, :17, :32, :47)
-    next_slot = ((minutes // 15) * 15 + 2) % 60
-    if minutes % 15 >= 2:
-        next_slot = ((minutes // 15 + 1) * 15 + 2) % 60
+    now = dt.datetime.now()
+    minutes = now.minute
+    seconds = now.second
 
-    # Секунд до следующего слота
-    delay = (next_slot - minutes) * 60 - seconds
+    # Вычисляем следующий слот (:02, :17, :32, :47)
+    slot_in_cycle = minutes % 15
+    if slot_in_cycle < 2:
+        # Мы до :02 в этом цикле → следующий слот сегодня
+        next_min = (minutes // 15) * 15 + 2
+    else:
+        # Мы после :02 → следующий слот через цикл
+        next_min = ((minutes // 15) + 1) * 15 + 2
+        if next_min >= 60:
+            next_min -= 60
+
+    delay = (next_min - minutes) * 60 - seconds
     if delay <= 0:
-        delay += 15 * 60  # +1 период если уже прошли
+        delay += 15 * 60  # через один полный цикл
+    if delay <= 0:
+        delay = 60  # гарантированно ждём хотя бы минуту
 
-    log(f"Next analysis at :{next_slot:02d}:00 (in {delay // 60}m {delay % 60}s)")
+    log(f"Next analysis at :{next_min:02d}:00 (in {delay // 60}m {delay % 60}s)")
     time.sleep(delay)
 
 
