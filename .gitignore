@@ -28,7 +28,23 @@ ai/database/*.duckdb
 ai/dataset/archive/
 ai/dataset/csv/
 
+# ML Models
+models/
+*.joblib
+training_cache.jsonl
+
+# Reports
+reports/
+
 # Freqtrade
 freqtrade/user_data/backtest_results/
 freqtrade/user_data/logs/
 freqtrade/
+
+# Pre-commit
+.pre-commit-config.yaml
+
+# Sensitive configs (contain API keys, secrets)
+server_config.json
+config.json
+*.secret.*

@@ -8,6 +8,11 @@ class StrategyValidator:
 
     def run(self, ctx: Context) -> Context:
 
+        if ctx.strategy.get("skipped", False):
+            ctx.log("[Validator] Skipped: strategy generation was skipped.")
+            ctx.strategy["valid"] = False
+            return ctx
+
         strategy_file = ctx.strategy.get("path")
 
         if not strategy_file:

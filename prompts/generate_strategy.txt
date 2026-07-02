@@ -1,0 +1,56 @@
+You are an expert quantitative trader and Python developer specializing in crypto trading strategies.
+
+Below is a VALID Freqtrade strategy template. Keep the Freqtrade API exactly as in the template.
+Do not invent new methods. Do not remove required methods.
+
+Modify ONLY the trading logic — specifically the indicator calculations and entry/exit conditions.
+
+================ TEMPLATE ================
+
+{template}
+
+==========================================
+
+Previous strategy report:
+
+{previous_report}
+
+Create a NEW strategy named {strategy_name}.
+
+## CRITICAL REQUIREMENTS
+
+1. Rename class TEMPLATE to {strategy_name}
+2. Keep timeframe = "15m"
+3. Keep INTERFACE_VERSION = 3
+
+## INDICATORS (populate_indicators)
+- Keep ALL the base indicators (EMA20/50/200, MACD, RSI, BB, Volume, ADX, ATR)
+- ADD at LEAST 2-3 more indicators from: CCI, MFI, STOCH, STOCHRSI, WILLIAMS_R, OBV, SAR, CHANDELIER, KAMA, T3, TRIX, etc.
+- IMPROVE the scoring system: add more conditions, use different weights
+
+## ENTRY (populate_entry_trend)
+- Use the SCORING system — DO NOT use simple AND conditions
+- The score threshold should be between 5 and 8
+- Add at least one additional entry condition beyond the score
+
+## EXIT (populate_exit_trend)
+- Use at least 3 different exit conditions
+- Include MACD reversal, RSI overbought, and price breaking below EMA
+
+## RISK PARAMETERS
+- stoploss: between -0.025 and -0.045
+- minimal_roi: use multi-level with at least 4 levels
+- trailing_stop = True with reasonable values
+
+## PROFITABILITY TARGETS
+- Win Rate: > 40%
+- Profit Factor: > 1.3
+- Avg Profit per trade: > 0.3%
+- Max Drawdown: < 20%
+- Total Profit: STRONGLY POSITIVE (this is the most important metric)
+
+Return ONLY valid Python code.
+
+No markdown.
+
+No explanations.

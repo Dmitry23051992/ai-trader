@@ -1,74 +1,49 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from core.llm import LLM
+from core.logger import log
 
 
 class StrategyGenerator:
 
-    def __init__(self):
+    def __init__(self, prompt_path: Path | str | None = None):
         self.llm = LLM()
+        self.prompt_path = Path(prompt_path or "prompts/generate_strategy.txt")
 
-    def generate(self, strategy_name: str, previous_report: str = ""):
+    def generate(self, strategy_name: str, previous_report: str = "") -> Path:
+        """Generate a Freqtrade strategy using the LLM.
 
-        template = Path(
-            "templates/freqtrade_template.py"
-        ).read_text(encoding="utf-8")
+        Args:
+            strategy_name: Name for the new strategy (used as class name + filename).
+            previous_report: Previous iteration's learning report for context.
 
-        prompt = f"""
-You are an expert quantitative trader and Python developer.
+        Returns:
+            Path to the saved strategy file.
+        """
+        template = Path("templates/freqtrade_template.py").read_text(encoding="utf-8")
+        prompt_template = self.prompt_path.read_text(encoding="utf-8")
 
-Below is a VALID Freqtrade strategy.
+        prompt = (
+            prompt_template.replace("{template}", template)
+            .replace("{previous_report}", previous_report)
+            .replace("{strategy_name}", strategy_name)
+        )
 
-Keep the Freqtrade API exactly as in the template.
-
-Do not invent new methods.
-
-Do not remove required methods.
-
-Modify ONLY the trading logic.
-
-================ TEMPLATE ================
-
-{template}
-
-==========================================
-
-Previous strategy report:
-
-{previous_report}
-
-Create a NEW strategy.
-
-Requirements:
-
-- Rename class TEMPLATE to {strategy_name}
-- Keep timeframe 15m
-- Improve profitability
-- Reduce drawdown
-- Improve winrate
-
-Return ONLY valid Python code.
-
-No markdown.
-
-No explanations.
-"""
+        log.debug("Generating strategy '{}' via LLM (prompt len={})", strategy_name, len(prompt))
 
         code = self.llm.ask(prompt)
 
-        code = code.replace("```python", "")
-        code = code.replace("```", "")
+        # Strip markdown code fences if present
+        code = code.replace("```python", "").replace("```", "").strip()
+
+        # Ensure class name matches filename
         code = code.replace("TEMPLATE", strategy_name)
-        code = code.strip()
 
-        strategy_path = (
-            Path("freqtrade/user_data/strategies")
-            / f"{strategy_name}.py"
-        )
+        strategy_path = Path("freqtrade/user_data/strategies") / f"{strategy_name}.py"
+        strategy_path.parent.mkdir(parents=True, exist_ok=True)
+        strategy_path.write_text(code, encoding="utf-8")
 
-        strategy_path.write_text(
-            code,
-            encoding="utf-8"
-        )
-
+        log.info("Strategy saved: {} ({:.1f} KB)", strategy_path, len(code) / 1024)
         return strategy_path

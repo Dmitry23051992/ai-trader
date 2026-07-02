@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Trader Agent — анализирует рынок через Ollama и управляет Freqtrade
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/home/user/ai-trader
+ExecStart=/usr/bin/python3 /home/user/ai-trader/ai_agent.py --daemon
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/home/user/ai-trader/freqtrade/user_data/logs/ai_agent_daemon.log
+StandardError=append:/home/user/ai-trader/freqtrade/user_data/logs/ai_agent_daemon.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1 @@
+"""Market intelligence helpers for live analysis and decision making."""

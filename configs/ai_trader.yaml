@@ -1,16 +1,74 @@
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  AI Trader — Configuration                                          ║
+# ║  Schema defined in configs/schema.py (class AppConfig)               ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+
 llm:
   provider: openrouter
-  model: openai/gpt-oss-20b:free
+  model: openai/gpt-4o-mini
 
-project:
-  root: /home/user/ai-trader
+exchange:
+  name: binance
+  market_type: spot
+  testnet: false
+  symbols:
+    - BTC/USDT
+    - ETH/USDT
+    - SOL/USDT
+  analysis_symbols:
+    - BTC/USDT
+    - ETH/USDT
+  timeframes:
+    - 5m
+    - 15m
+    - 1h
+    - 4h
+  analysis_timeframes:
+    - 15m
+    - 1h
+  lookback_bars: 240
+  trend_adx_threshold: 25.0
+  start_date: "2019-01-01"
+  download_limit: 1000
+  request_delay: 0.2
+  update_overlap: 10
 
-freqtrade:
-  strategy_dir: /home/user/ai-trader/freqtrade/user_data/strategies
-  backtest_script: /home/user/ai-trader/automation/backtest.sh
+risk:
+  decision_confidence_threshold: 0.55
+  base_position_size_pct: 1.0
+  max_position_size_pct: 5.0
+  min_position_size_pct: 0.25
+  base_stop_loss_pct: 2.0
+  base_take_profit_pct: 5.0
+  base_trailing_stop_pct: 1.5
+  max_daily_loss_pct: 5.0
+  max_consecutive_losses: 4
 
-git:
-  auto_commit: true
+execution:
+  mode: paper
+  paper_portfolio_usdt: 1000.0
+  default_order_type: market
+
+adaptive:
+  min_closed_trades: 3
+  min_position_size_multiplier: 0.5
+  max_position_size_multiplier: 1.25
+  max_confidence_threshold: 0.85
+  min_confidence_threshold: 0.55
+  random_seed: 42
+  train_test_split: 0.8
+  validation_split: 0.1
+
+paths:
+  ai_dir: ai
+  database_dir: ai/database
+  log_dir: logs
+  model_dir: models
+  report_dir: reports
+  freqtrade_dir: freqtrade
+  strategy_dir: freqtrade/user_data/strategies
+  backtest_results_dir: freqtrade/user_data/backtest_results
 
 loop:
   max_iterations: 20
+  fail_fast: false
