@@ -35,25 +35,29 @@ class AI_AdaptiveStrategy(IStrategy):
         "240": 0.008,   # 0.8% через 4 часа (не сидеть вечно)
     }
 
-    # ── Стоп-лосс: чуть жёстче ───────────────────────────────
-    stoploss = -0.025  # было -0.035 — теперь убыток не уходит дальше -2.5%
+    # ── Стоп-лосс: широкий — даём сделке дышать ─────────────
+    # Мемкоины волатильны: -5..-7% это нормально, они отскакивают.
+    # Старый стоп (-2.5%) выбивал до разворота — убыток на ровном месте.
+    # Новый: -8% — сработает только при реальном обвале.
+    stoploss = -0.08
 
-    # ── Трейлинг: подтягиваем после 3% ───────────────────────
+    # ── Трейлинг: фиксируем прибыль, не трогаем убытки ──────
     trailing_stop = True
-    trailing_stop_positive = 0.01    # было 0.008 — фиксируем 1% при движении вверх
-    trailing_stop_positive_offset = 0.03  # было 0.025 — начинаем трейлить после 3%
+    trailing_stop_positive = 0.01
+    trailing_stop_positive_offset = 0.04  # начинаем трейлить после 4% прибыли
     trailing_only_offset_is_reached = True
 
     process_only_new_candles = True
     startup_candle_count = 200
     use_exit_signal = True
     exit_profit_only = False
+    use_custom_stoploss = True  # чтобы custom_stoploss() работал
 
     # ── Hyperopt-параметры ────────────────────────────────────
     buy_rsi = IntParameter(35, 65, default=45, space="buy")
     buy_adx = IntParameter(18, 32, default=20, space="buy")
     sell_rsi = IntParameter(70, 88, default=80, space="sell")
-    base_stoploss = DecimalParameter(-0.04, -0.015, default=-0.025, decimals=3, space="sell")
+    base_stoploss = DecimalParameter(-0.10, -0.03, default=-0.08, decimals=3, space="sell")
 
     # ── AI-параметры ──────────────────────────────────────────
     _ai_params: dict = {}
@@ -279,33 +283,26 @@ class AI_AdaptiveStrategy(IStrategy):
 
     def custom_stoploss(self, pair: str, trade, current_time, current_rate,
                         current_profit, **kwargs) -> float:
-        """Стоп-лосс адаптируется к режиму рынка, но без паники.
-        Главное правило: убыток не должен превышать возможную прибыль."""
-        params = self.ai_params
-        regime_mult = self._get_regime_multiplier()
+        """Стоп-лосс: широкий, чтобы не выбивало до разворота.
+        
+        Главное правило: мемкоины волатильны, -7% это ещё не крах.
+        Даём сделке минимум 8% пространства. Подтягиваем только при 
+        хорошей прибыли — фиксируем достигнутое.
+        """
+        base_sl = float(self.stoploss)  # -0.08
 
-        # AI-стоплосс (базовое значение)
-        ai_sl = params.get("stoploss")
-        if ai_sl is not None and isinstance(ai_sl, (int, float)):
-            base_sl = max(-0.04, min(-0.015, float(ai_sl)))
-        else:
-            base_sl = float(self.base_stoploss.value)
+        # ── Защита прибыли: подтягиваем стоп ──────────────
+        if current_profit > 0.06:
+            return 0.005    # 6%+ профита → стоп в 0.5% (не отдаём прибыль)
+        if current_profit > 0.04:
+            return 0.01     # 4%+ профита → стоп в 1%
+        if current_profit > 0.02:
+            return 0.015    # 2%+ профита → стоп в 1.5%
 
-        # Подтягиваем при профите — фиксируем прибыль
-        if current_profit > 0.05:
-            return 0.005    # 5% профита → стоп в 0.5% (защита от разворота)
-        if current_profit > 0.03:
-            return 0.01     # 3% профита → стоп в 1%
-        if current_profit > 0.015:
-            return 0.015    # 1.5% профита → стоп в 1.5%
-
-        # В плохом рынке — не даём убытку расти
-        if regime_mult < 0.3:
-            return max(base_sl, -0.02)   # макс -2% при панике
-        if regime_mult < 0.6:
-            return max(base_sl, -0.025)  # макс -2.5% при медвежьем
-
-        return max(base_sl, -0.03)  # макс -3% в норме (было -3.5%)
+        # ── Убыток: НЕ подтягиваем, даём восстановиться ──
+        # Если сделка в минусе — стоп остаётся на -8%
+        # Если в небольшом плюсе (<2%) — тоже -8%, даём расти
+        return base_sl  # -0.08 — только реальный обвал пробьёт
 
     def custom_stake_amount(self, pair: str, current_time, current_rate,
                             proposed_stake, min_stake, max_stake, leverage,

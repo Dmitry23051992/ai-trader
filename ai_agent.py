@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # ── Конфигурация ─────────────────────────────────────────────
@@ -1039,30 +1039,23 @@ def sleep_until_next_candle():
     Таймфрейм 15m → свечи закрываются в :00/:15/:30/:45.
     Запускаем анализ в :02/:17/:32/:47 — даём время данным обновиться.
     """
-    import datetime as dt
+    now = datetime.now()
 
-    now = dt.datetime.now()
-    minutes = now.minute
-    seconds = now.second
+    # Базовый слот в текущем 15-минутном окне: :02/:17/:32/:47
+    slot_minute = (now.minute // 15) * 15 + 2
+    next_run = now.replace(minute=0, second=0, microsecond=0) + timedelta(minutes=slot_minute)
 
-    # Вычисляем следующий слот (:02, :17, :32, :47)
-    slot_in_cycle = minutes % 15
-    if slot_in_cycle < 2:
-        # Мы до :02 в этом цикле → следующий слот сегодня
-        next_min = (minutes // 15) * 15 + 2
-    else:
-        # Мы после :02 → следующий слот через цикл
-        next_min = ((minutes // 15) + 1) * 15 + 2
-        if next_min >= 60:
-            next_min -= 60
+    # Если уже прошли слот, двигаем на следующий 15-минутный период.
+    while next_run <= now:
+        next_run += timedelta(minutes=15)
 
-    delay = (next_min - minutes) * 60 - seconds
-    if delay <= 0:
-        delay += 15 * 60  # через один полный цикл
-    if delay <= 0:
-        delay = 60  # гарантированно ждём хотя бы минуту
+    delay = int((next_run - now).total_seconds())
+    delay = max(delay, 1)
 
-    log(f"Next analysis at :{next_min:02d}:00 (in {delay // 60}m {delay % 60}s)")
+    log(
+        f"Next analysis at {next_run.strftime('%H:%M:%S')} "
+        f"(in {delay // 60}m {delay % 60}s)"
+    )
     time.sleep(delay)
 
 
