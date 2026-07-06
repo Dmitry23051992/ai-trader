@@ -22,18 +22,13 @@ class AI_AdaptiveStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "15m"
 
-    # ── ROI: даём прибыли расти ──────────────────────────────
-    # Старое: 0.01 → 0.008 → 0.005 → 0.002  (avg win: ~0.7%)
-    # Новое:  0.025 → 0.02 → 0.015 → 0.008  (avg win: ~1.8%)
-    #
-    # При avg_loss ~1.6% и winrate 55%:
-    #   EV = 0.55*1.8 + 0.45*(-1.6) = +0.27% на сделку ✓
-    minimal_roi = {
-        "0": 0.025,     # 2.5% — даём прибыли расти
-        "60": 0.02,     # 2.0% через 1 час
-        "120": 0.015,   # 1.5% через 2 часа
-        "240": 0.008,   # 0.8% через 4 часа (не сидеть вечно)
-    }
+    # ── ROI: отключён — полагаемся на трейлинг и custom_stoploss ─
+    # ROI резал прибыль: после 4ч порог падал до 0.8%, и 2-дневные
+    # сделки закрывались с копейками. Теперь выходы управляются:
+    #   - trailing_stop — фиксирует прибыль после 4%
+    #   - custom_stoploss — подтягивает стоп при 2%/4%/6%+
+    #   - populate_exit_trend — выход при перекупленности (RSI > 80)
+    minimal_roi = {}
 
     # ── Стоп-лосс: широкий — даём сделке дышать ─────────────
     # Мемкоины волатильны: -5..-7% это нормально, они отскакивают.
@@ -245,11 +240,12 @@ class AI_AdaptiveStrategy(IStrategy):
             )
 
         elif ai_signal == "hold" or regime_mult < 0.6:
-            # === Неопределённость — умеренные условия ===
+            # === Неопределённость — мягкий вход без моментума ===
+            # В bearish рынке mom_bull редко выполняется, поэтому не блокируем вход.
+            # Достаточно: score + тренд (или цена выше EMA50).
             entry = (
                 score_ok &
-                trend_ok &
-                (dataframe["mom_bull"] == 1)
+                trend_ok
             )
         else:
             # === Без сигнала — стандартная логика ===
@@ -265,9 +261,14 @@ class AI_AdaptiveStrategy(IStrategy):
 
     # ── ВЫХОД ──────────────────────────────────────────────────
     #
-    # AI НЕ управляет выходами. Только ROI, стоп-лосс и трейлинг.
-    # exit_signal используется только для перекупленности (RSI > 80).
-    # Это предотвращает панические продажи всех позиций разом.
+    # AI НЕ управляет выходами.
+    # Выходы управляются (в порядке приоритета):
+    #   1. custom_stoploss — подтягивает при профите 2%/4%/6%+
+    #   2. trailing_stop — фиксирует прибыль при падении с 4%+
+    #   3. populate_exit_trend — RSI > 80 (перекупленность)
+    #   4. custom_exit — stale trade >3 дней без движения
+    #   5. stoploss = -8% — только реальный обвал
+    # ROY отключён — больше не режет прибыль раньше времени.
     # ──────────────────────────────────────────────────────────
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -353,7 +354,20 @@ class AI_AdaptiveStrategy(IStrategy):
 
     def custom_exit(self, pair: str, trade, current_time, current_rate,
                     current_profit, **kwargs) -> str | None:
-        """Не используется. AI управляет только входами."""
+        """Выход только по времени — не даём сделкам висеть вечно.
+        
+        С ROI 0%/отключён, сделка может сидеть в 0-1% неделями.
+        Освобождаем капитал: если прошло >3 дней и профит <1% — выходим.
+        """
+        # Дни, сколько сделка открыта
+        if trade.open_date_utc:
+            days_open = (current_time - trade.open_date_utc).days
+            # 3 дня без движения → выходим, освобождаем капитал
+            if days_open >= 3 and current_profit < 0.01:
+                return "stale_trade"
+            # 7 дней в любом случае → выходим
+            if days_open >= 7:
+                return "stale_trade"
         return None
 
     def adjust_entry_price(self, trade, order, pair, current_time, proposed_rate, current_order_rate):
