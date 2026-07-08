@@ -22,37 +22,41 @@ class AI_AdaptiveStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "15m"
 
-    # ── ROI: отключён — полагаемся на трейлинг и custom_stoploss ─
-    # ROI резал прибыль: после 4ч порог падал до 0.8%, и 2-дневные
-    # сделки закрывались с копейками. Теперь выходы управляются:
-    #   - trailing_stop — фиксирует прибыль после 4%
-    #   - custom_stoploss — подтягивает стоп при 2%/4%/6%+
-    #   - populate_exit_trend — выход при перекупленности (RSI > 80)
-    minimal_roi = {}
+    # ── ROI: 5% → 4% → 2% — берём прибыль ──────────────────
+    # Главное: прибыль должна БЫТЬ зафиксирована, пока она есть.
+    # 5% — быстрый выход на сильных движениях.
+    # 1-4ч — постепенно снижаем планку.
+    minimal_roi = {
+        "0": 0.05,      # 5% — сразу фиксируем
+        "60": 0.04,     # 4% через 1 час
+        "240": 0.02,    # 2% через 4 часа
+    }
 
-    # ── Стоп-лосс: широкий — даём сделке дышать ─────────────
-    # Мемкоины волатильны: -5..-7% это нормально, они отскакивают.
-    # Старый стоп (-2.5%) выбивал до разворота — убыток на ровном месте.
-    # Новый: -8% — сработает только при реальном обвале.
-    stoploss = -0.08
+    # ── Стоп-лосс: -15% — мемкоины волатильны ──────────────
+    # -8% оказалось слишком мало: ADA -8.22%, TURBO -7.11%.
+    # Теперь -15% — сработает только при реальном обвале.
+    # custom_stoploss сужает стоп со временем.
+    stoploss = -0.15
 
-    # ── Трейлинг: фиксируем прибыль, не трогаем убытки ──────
+    # ── Трейлинг: фиксируем 3% прибыли ─────────────────────
+    # Было 1% — выбивало из прибыли. Теперь 3% — даём рост,
+    # но фиксируем при падении с 4%+.
     trailing_stop = True
-    trailing_stop_positive = 0.01
-    trailing_stop_positive_offset = 0.04  # начинаем трейлить после 4% прибыли
+    trailing_stop_positive = 0.03
+    trailing_stop_positive_offset = 0.04
     trailing_only_offset_is_reached = True
 
     process_only_new_candles = True
     startup_candle_count = 200
     use_exit_signal = True
     exit_profit_only = False
-    use_custom_stoploss = True  # чтобы custom_stoploss() работал
+    use_custom_stoploss = True
 
     # ── Hyperopt-параметры ────────────────────────────────────
     buy_rsi = IntParameter(35, 65, default=45, space="buy")
     buy_adx = IntParameter(18, 32, default=20, space="buy")
     sell_rsi = IntParameter(70, 88, default=80, space="sell")
-    base_stoploss = DecimalParameter(-0.10, -0.03, default=-0.08, decimals=3, space="sell")
+    base_stoploss = DecimalParameter(-0.18, -0.05, default=-0.15, decimals=3, space="sell")
 
     # ── AI-параметры ──────────────────────────────────────────
     _ai_params: dict = {}
@@ -284,26 +288,37 @@ class AI_AdaptiveStrategy(IStrategy):
 
     def custom_stoploss(self, pair: str, trade, current_time, current_rate,
                         current_profit, **kwargs) -> float:
-        """Стоп-лосс: широкий, чтобы не выбивало до разворота.
+        """Стоп-лосс: -15% первые 12ч, затем сужается.
         
-        Главное правило: мемкоины волатильны, -7% это ещё не крах.
-        Даём сделке минимум 8% пространства. Подтягиваем только при 
-        хорошей прибыли — фиксируем достигнутое.
+        Meme-coin'ы волатильны: -8..-12% это нормальный шум.
+        Даём сделке пространство в первый день. Если за 12ч
+        не восстановилась — начинаем сужать, чтобы не терять 
+        капитал в безнадёжных сделках.
+        
+        При прибыли — подтягиваем, фиксируем достигнутое.
         """
-        base_sl = float(self.stoploss)  # -0.08
-
-        # ── Защита прибыли: подтягиваем стоп ──────────────
+        # ── Защита прибыли (приоритет 1) ──────────────────
+        if current_profit > 0.08:
+            return 0.005    # 8%+ → стоп в 0.5%
         if current_profit > 0.06:
-            return 0.005    # 6%+ профита → стоп в 0.5% (не отдаём прибыль)
+            return 0.01     # 6%+ → стоп в 1%
         if current_profit > 0.04:
-            return 0.01     # 4%+ профита → стоп в 1%
+            return 0.02     # 4%+ → стоп в 2%
         if current_profit > 0.02:
-            return 0.015    # 2%+ профита → стоп в 1.5%
+            return 0.025    # 2%+ → стоп в 2.5%
 
-        # ── Убыток: НЕ подтягиваем, даём восстановиться ──
-        # Если сделка в минусе — стоп остаётся на -8%
-        # Если в небольшом плюсе (<2%) — тоже -8%, даём расти
-        return base_sl  # -0.08 — только реальный обвал пробьёт
+        # ── Время: чем дольше сделка, тем жёстче стоп ────
+        if trade.open_date_utc:
+            hours_open = (current_time - trade.open_date_utc).total_seconds() / 3600
+            if hours_open > 48:
+                return -0.03    # 2 дня → -3% (хватит ждать)
+            if hours_open > 24:
+                return -0.05    # 1 день → -5%
+            if hours_open > 12:
+                return -0.10    # 12ч → -10%
+
+        # ── Первые 12ч: широкий стоп ─────────────────────
+        return -0.15    # -15% — только реальный обвал
 
     def custom_stake_amount(self, pair: str, current_time, current_rate,
                             proposed_stake, min_stake, max_stake, leverage,
@@ -354,23 +369,20 @@ class AI_AdaptiveStrategy(IStrategy):
 
     def custom_exit(self, pair: str, trade, current_time, current_rate,
                     current_profit, **kwargs) -> str | None:
-        """Выход только по времени — не даём сделкам висеть вечно.
+        """Выход застаревших сделок — освобождаем капитал.
         
-        С ROI 0%/отключён, сделка может сидеть в 0-1% неделями.
-        Освобождаем капитал: если прошло >3 дней и профит <1% — выходим.
+        custom_stoploss уже сужает стоп до -3% к 48ч.
+        Этот exit — последняя страховка: если стоп-лосс не сработал
+        (например из-за гэпа), форсируем выход.
         """
-        # Дни, сколько сделка открыта
         if trade.open_date_utc:
             days_open = (current_time - trade.open_date_utc).days
-            # 3 дня без движения → выходим, освобождаем капитал
-            if days_open >= 3 and current_profit < 0.01:
-                return "stale_trade"
-            # 7 дней в любом случае → выходим
-            if days_open >= 7:
+            # 5 дней — любые сделки закрываем
+            if days_open >= 5 and current_profit < 0.02:
                 return "stale_trade"
         return None
 
-    def adjust_entry_price(self, trade, order, pair, current_time, proposed_rate, current_order_rate):
+    def adjust_entry_price(self, trade, order, pair, current_time, proposed_rate, current_order_rate, entry_tag=None):
         return proposed_rate
 
     def leverage(self, pair: str, current_time, current_rate,
