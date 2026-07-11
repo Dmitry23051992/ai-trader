@@ -27,9 +27,9 @@ class AI_AdaptiveStrategy(IStrategy):
     # 5% — быстрый выход на сильных движениях.
     # 1-4ч — постепенно снижаем планку.
     minimal_roi = {
-        "0": 0.025,      # 5% — сразу фиксируем
-        "60": 0.015,     # 4% через 1 час
-        "240": 0.008,    # 2% через 4 часа
+        "0": 0.05,      # 5% — сразу фиксируем
+        "60": 0.03,     # 4% через 1 час
+        "240": 0.02,    # 2% через 4 часа
     }
 
     # ── Стоп-лосс: -15% — мемкоины волатильны ──────────────
@@ -42,8 +42,8 @@ class AI_AdaptiveStrategy(IStrategy):
     # Было 1% — выбивало из прибыли. Теперь 3% — даём рост,
     # но фиксируем при падении с 4%+.
     trailing_stop = True
-    trailing_stop_positive = 0.02
-    trailing_stop_positive_offset = 0.03
+    trailing_stop_positive = 0.03
+    trailing_stop_positive_offset = 0.05
     trailing_only_offset_is_reached = True
 
     process_only_new_candles = True
@@ -313,14 +313,14 @@ class AI_AdaptiveStrategy(IStrategy):
         ai_stop = params.get("stoploss", None)
         
         # ── Защита прибыли (приоритет 1) ──────────────────
-        if current_profit > 0.04:
-            return 0.01     # 4%+ → стоп в 1%
-        if current_profit > 0.02:
-            return 0.02     # 2%+ → стоп в 2%
+        if current_profit > 0.05:
+            return 0.02     # 5%+ → стоп в 1%
+        if current_profit > 0.03:
+            return 0.03     # 3%+ → стоп в 2%
         if current_profit > 0.01:
-            return 0.03     # 1%+ → стоп в 3%
+            return 0.04     # 1%+ → стоп в 3%
         if current_profit > 0:
-            return 0.04     # 0%+ → стоп в 4% (защита безубытка)
+            return 0.05     # 0%+ → стоп в 4% (защита безубытка)
 
         # ── AI стоп-лосс (для убыточных сделок) ───────────
         if ai_stop is not None and isinstance(ai_stop, (int, float)):
@@ -332,14 +332,14 @@ class AI_AdaptiveStrategy(IStrategy):
         if trade.open_date_utc:
             hours_open = (current_time - trade.open_date_utc).total_seconds() / 3600
             if hours_open > 36:
-                return -0.03    # 36ч → -3% (хватит ждать)
+                return -0.04    # 36ч → -3% (хватит ждать)
             if hours_open > 18:
-                return -0.05    # 18ч → -5%
+                return -0.06    # 18ч → -5%
             if hours_open > 8:
-                return -0.06    # 8ч → -6%
+                return -0.08    # 8ч → -6%
 
         # ── Первые 8ч: базовый стоп ──────────────────────
-        return -0.08    # -8% — только реальный обвал
+        return -0.10    # -10% — только реальный обвал
 
     def custom_stake_amount(self, pair: str, current_time, current_rate,
                             proposed_stake, min_stake, max_stake, leverage,
