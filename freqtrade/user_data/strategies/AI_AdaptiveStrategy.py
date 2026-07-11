@@ -36,14 +36,14 @@ class AI_AdaptiveStrategy(IStrategy):
     # -8% оказалось слишком мало: ADA -8.22%, TURBO -7.11%.
     # Теперь -15% — сработает только при реальном обвале.
     # custom_stoploss сужает стоп со временем.
-    stoploss = -0.08
+    stoploss = -0.05
 
     # ── Трейлинг: фиксируем 3% прибыли ─────────────────────
     # Было 1% — выбивало из прибыли. Теперь 3% — даём рост,
     # но фиксируем при падении с 4%+.
     trailing_stop = True
-    trailing_stop_positive = 0.03
-    trailing_stop_positive_offset = 0.05
+    trailing_stop_positive = 0.02
+    trailing_stop_positive_offset = 0.04
     trailing_only_offset_is_reached = True
 
     process_only_new_candles = True
@@ -248,12 +248,13 @@ class AI_AdaptiveStrategy(IStrategy):
             )
 
         elif ai_signal == "hold" or regime_mult < 0.6:
-            # === Неопределённость — мягкий вход без моментума ===
-            # В bearish рынке mom_bull редко выполняется, поэтому не блокируем вход.
-            # Достаточно: score + тренд (или цена выше EMA50).
+            # === Неопределённость — вход только с подтверждением ===
+            # Добавляем volume + ATR чтобы не ловить ложные сигналы
             entry = (
                 score_ok &
-                trend_ok
+                trend_ok &
+                (dataframe["vol_ok"] == 1) &
+                (dataframe["atr_ok"] == 1)
             )
         else:
             # === Без сигнала — стандартная логика ===
@@ -301,12 +302,14 @@ class AI_AdaptiveStrategy(IStrategy):
         3. Время (чем дольше сделка, тем жёстче стоп)
         4. Базовый стоп -8%
         """
-        # AI stoploss (first 6h)
+        # AI stoploss + bridge (first 12h)
         ai_sl = self.ai_params.get("stoploss")
         if ai_sl is not None and trade.open_date_utc:
             h = (current_time - trade.open_date_utc).total_seconds() / 3600
             if h < 6:
-                return float(ai_sl)
+                return float(ai_sl)  # AI stop for first 6h
+            if h < 12:
+                return -0.04  # Bridge: smooth transition 6h-12h
 
         # ── AI-рекомендация стопа ────────────────────────────
         params = self.ai_params
@@ -332,14 +335,14 @@ class AI_AdaptiveStrategy(IStrategy):
         if trade.open_date_utc:
             hours_open = (current_time - trade.open_date_utc).total_seconds() / 3600
             if hours_open > 36:
-                return -0.04    # 36ч → -3% (хватит ждать)
+                return -0.03    # 36ч → -3% (хватит ждать)
             if hours_open > 18:
-                return -0.06    # 18ч → -5%
+                return -0.04    # 18ч → -5%
             if hours_open > 8:
-                return -0.08    # 8ч → -6%
+                return -0.05    # 8ч → -6%
 
         # ── Первые 8ч: базовый стоп ──────────────────────
-        return -0.10    # -10% — только реальный обвал
+        return -0.05    # -5% — memecoins are brutal, cut early
 
     def custom_stake_amount(self, pair: str, current_time, current_rate,
                             proposed_stake, min_stake, max_stake, leverage,
@@ -398,8 +401,11 @@ class AI_AdaptiveStrategy(IStrategy):
         """
         if trade.open_date_utc:
             days_open = (current_time - trade.open_date_utc).days
-            # 5 дней — любые сделки закрываем
-            if days_open >= 3 and current_profit < 0.02:
+            # 2 дня — любые убыточные сделки закрываем
+            if days_open >= 2 and current_profit < 0.0:
+                return "stale_trade"
+            # 3 дня — если прибыль меньше 1%
+            if days_open >= 3 and current_profit < 0.01:
                 return "stale_trade"
         return None
 
