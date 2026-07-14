@@ -38,12 +38,12 @@ class AI_AdaptiveStrategy(IStrategy):
     # custom_stoploss сужает стоп со временем.
     stoploss = -0.15
 
-    # ── Трейлинг: фиксируем 3% прибыли ─────────────────────
-    # Было 1% — выбивало из прибыли. Теперь 3% — даём рост,
-    # но фиксируем при падении с 4%+.
+    # ── Трейлинг: фиксируем 5% прибыли ─────────────────────
+    # Мемкоинам нужно пространство: 5% трейлинг от пика.
+    # Активируется при 8%+ профита — не выбивает на шуме.
     trailing_stop = True
-    trailing_stop_positive = 0.03
-    trailing_stop_positive_offset = 0.04
+    trailing_stop_positive = 0.05
+    trailing_stop_positive_offset = 0.08
     trailing_only_offset_is_reached = True
 
     process_only_new_candles = True
@@ -244,12 +244,15 @@ class AI_AdaptiveStrategy(IStrategy):
             )
 
         elif ai_signal == "hold" or regime_mult < 0.6:
-            # === Неопределённость — мягкий вход без моментума ===
-            # В bearish рынке mom_bull редко выполняется, поэтому не блокируем вход.
-            # Достаточно: score + тренд (или цена выше EMA50).
+            # === Неопределённость — строгий вход ===
+            # Без уверенности AI не входим на слабых сигналах.
+            # Требуем: score + тренд + объём + RSI в норме.
             entry = (
                 score_ok &
-                trend_ok
+                trend_ok &
+                (dataframe["vol_ok"] == 1) &
+                (dataframe["rsi"] >= 35) &
+                (dataframe["rsi"] <= 70)
             )
         else:
             # === Без сигнала — стандартная логика ===
@@ -267,12 +270,11 @@ class AI_AdaptiveStrategy(IStrategy):
     #
     # AI НЕ управляет выходами.
     # Выходы управляются (в порядке приоритета):
-    #   1. custom_stoploss — подтягивает при профите 2%/4%/6%+
-    #   2. trailing_stop — фиксирует прибыль при падении с 4%+
+    #   1. custom_stoploss — подтягивает при профите 3%/5%/8%+
+    #   2. trailing_stop — фиксирует прибыль при падении с 8%+
     #   3. populate_exit_trend — RSI > 80 (перекупленность)
-    #   4. custom_exit — stale trade >3 дней без движения
-    #   5. stoploss = -8% — только реальный обвал
-    # ROY отключён — больше не режет прибыль раньше времени.
+    #   4. custom_exit — stale trade >5 дней
+    #   5. stoploss = -15% — только реальный обвал
     # ──────────────────────────────────────────────────────────
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -290,22 +292,26 @@ class AI_AdaptiveStrategy(IStrategy):
                         current_profit, **kwargs) -> float:
         """Стоп-лосс: -15% первые 12ч, затем сужается.
         
+        ВАЖНО: НЕ используем AI stoploss из ai_params.json!
+        ОН СЛИШКОМ ТУГОЙ (-3.5%) И РЕЖЕТ ВСЕ СДЕЛКИ.
+        Используем только собственные расчёты.
+        
         Meme-coin'ы волатильны: -8..-12% это нормальный шум.
         Даём сделке пространство в первый день. Если за 12ч
         не восстановилась — начинаем сужать, чтобы не терять 
         капитал в безнадёжных сделках.
         
-        При прибыли — подтягиваем, фиксируем достигнутое.
+        При прибыли — подтягиваем, но с запасом.
         """
         # ── Защита прибыли (приоритет 1) ──────────────────
+        if current_profit > 0.10:
+            return 0.005    # 10%+ → стоп в 0.5%
         if current_profit > 0.08:
-            return 0.005    # 8%+ → стоп в 0.5%
-        if current_profit > 0.06:
-            return 0.01     # 6%+ → стоп в 1%
-        if current_profit > 0.04:
-            return 0.02     # 4%+ → стоп в 2%
-        if current_profit > 0.02:
-            return 0.025    # 2%+ → стоп в 2.5%
+            return 0.01     # 8%+ → стоп в 1%
+        if current_profit > 0.05:
+            return 0.02     # 5%+ → стоп в 2%
+        if current_profit > 0.03:
+            return 0.03     # 3%+ → стоп в 3% (от пика)
 
         # ── Время: чем дольше сделка, тем жёстче стоп ────
         if trade.open_date_utc:
