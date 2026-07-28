@@ -1,10 +1,6 @@
-"""
-AI Adaptive Strategy v5 — Risk-controlled growth.
-Максимальный доход с разумным риском.
-Фикс: ROI даёт прибыли расти, exit_signal не паникует.
-"""
+"""AI Adaptive Strategy v8 — profit-max and drawdown control."""
 
-from freqtrade.strategy import IStrategy, IntParameter, DecimalParameter
+from freqtrade.strategy import IStrategy, IntParameter, DecimalParameter, stoploss_from_open
 from pandas import DataFrame
 import talib.abstract as ta
 import json
@@ -22,46 +18,77 @@ class AI_AdaptiveStrategy(IStrategy):
     INTERFACE_VERSION = 3
     timeframe = "15m"
 
-    # ── ROI: 5% → 4% → 2% — берём прибыль ──────────────────
-    # Главное: прибыль должна БЫТЬ зафиксирована, пока она есть.
-    # 5% — быстрый выход на сильных движениях.
-    # 1-4ч — постепенно снижаем планку.
+    # ROI под 15m: даём прибыли расти, а не режем на 1.8%.
+    # Проблема: все PEOPLE закрыты по ROI на +1.9%, но могли бы дать больше.
+    # Убыточные пары (SOL -4.5%, WIF -3.9%, ETH -4.7%) держались 18ч до stale_trade.
+    # Решение: поднимаем ROI до 3.5%, чтобы победители перевешивали проигравших.
     minimal_roi = {
-        "0": 0.05,      # 5% — сразу фиксируем
-        "60": 0.04,     # 4% через 1 час
-        "240": 0.02,    # 2% через 4 часа
+        "0": 0.035,      # 3.5% — даём росту реализоваться
+        "120": 0.025,    # 2.5% через 2 часа
+        "480": 0.015,    # 1.5% через 8 часов
+        "1440": 0.008,   # 0.8% через 24 часа
     }
 
-    # ── Стоп-лосс: -15% — мемкоины волатильны ──────────────
-    # -8% оказалось слишком мало: ADA -8.22%, TURBO -7.11%.
-    # Теперь -15% — сработает только при реальном обвале.
-    # custom_stoploss сужает стоп со временем.
-    stoploss = -0.15
+    # ── Стоп-лосс: -5% — режем потери быстро ───────────────
+    # stale_trade выходил при -3.9..-4.7% через 18ч.
+    # Ждать 18ч для -5% убытка — это смертельно для капитала.
+    # Теперь -5% — стоп срабатывает раньше stale_trade.
+    stoploss = -0.05
 
-    # ── Трейлинг: фиксируем 5% прибыли ─────────────────────
-    # Мемкоинам нужно пространство: 5% трейлинг от пика.
-    # Активируется при 8%+ профита — не выбивает на шуме.
-    trailing_stop = True
-    trailing_stop_positive = 0.05
-    trailing_stop_positive_offset = 0.08
-    trailing_only_offset_is_reached = True
+    # ── Трейлинг отключён ───────────────────────────────────
+    # В реальной торговле trailing_stop_loss часто фиксировал убыточные выходы
+    # на локальном шуме. Защиту прибыли берёт на себя custom_stoploss.
+    trailing_stop = False
+    # trailing_stop_positive отключен, т.к. конкурирует с custom_stoploss
+    trailing_stop_positive = None
+    trailing_stop_positive_offset = None
+    trailing_only_offset_is_reached = False
 
     process_only_new_candles = True
     startup_candle_count = 200
     use_exit_signal = True
-    exit_profit_only = False
+    # Ключевой фикс: закрытие по exit_signal только если сделка уже в прибыли.
+    exit_profit_only = True
+    # Компенсация комиссии/проскальзывания для выхода по сигналу.
+    exit_profit_offset = 0.004
     use_custom_stoploss = True
 
+    @property
+    def protections(self):
+        return [
+            {
+                "method": "CooldownPeriod",
+                "stop_duration_candles": 4,
+            },
+            {
+                "method": "StoplossGuard",
+                "lookback_period_candles": 48,
+                "trade_limit": 3,
+                "stop_duration_candles": 12,
+                "only_per_pair": True,
+            },
+            {
+                "method": "LowProfitPairs",
+                "lookback_period_candles": 96,
+                "trade_limit": 4,
+                "stop_duration_candles": 24,
+                "required_profit": 0.01,
+                "only_per_pair": True,
+            },
+        ]
+
     # ── Hyperopt-параметры ────────────────────────────────────
-    buy_rsi = IntParameter(35, 65, default=45, space="buy")
-    buy_adx = IntParameter(18, 32, default=20, space="buy")
-    sell_rsi = IntParameter(70, 88, default=80, space="sell")
+    buy_rsi = IntParameter(38, 60, default=48, space="buy")
+    buy_adx = IntParameter(18, 32, default=22, space="buy")
+    sell_rsi = IntParameter(65, 85, default=75, space="sell")
     base_stoploss = DecimalParameter(-0.18, -0.05, default=-0.15, decimals=3, space="sell")
 
     # ── AI-параметры ──────────────────────────────────────────
     _ai_params: dict = {}
     _params_path: Path = Path("/freqtrade/user_data/ai_params.json")
     _ai_params_ts: float = 0.0
+    hard_avoid_pairs = {"DOGE/USDT", "PEPE/USDT", "SHIB/USDT"}
+    preferred_pairs = {"FLOKI/USDT", "TURBO/USDT", "PEOPLE/USDT"}
     # Запоминаем ai_signal на момент входа, чтобы выход не менялся
     # если AI передумает mid-trade
     @property
@@ -185,6 +212,9 @@ class AI_AdaptiveStrategy(IStrategy):
         score += dataframe["near_ema20"] * 1
         score += dataframe["macd_rising"] * 1
         score += dataframe["rsi_mom"] * 1
+        dataframe["atr_ok"] = ((dataframe["atr_pct"] < 6.0) & (dataframe["atr_pct"] > 0.3)).astype(int)
+        score += dataframe["atr_ok"] * 2
+
         dataframe["buy_score"] = score
 
         return dataframe
@@ -204,11 +234,15 @@ class AI_AdaptiveStrategy(IStrategy):
         dataframe["enter_long"] = 0
 
         pair = metadata.get("pair", "")
+        if pair in self.hard_avoid_pairs:
+            return dataframe
+
         params = self.ai_params
         ai_signal = params.get("ai_signal", "hold")
         rec_pairs = params.get("recommended_pairs", [])
         avoid_pairs = params.get("avoid_pairs", [])
-        conf = params.get("confidence_threshold", 0.5)
+        # Минимальный порог уверенности ограничивает переторговку в шуме.
+        conf = max(float(params.get("confidence_threshold", 0.5)), 0.55)
         regime_mult = self._get_regime_multiplier()
 
         # Если AI сказал "sell" — не входим (кроме режима паники)
@@ -221,6 +255,9 @@ class AI_AdaptiveStrategy(IStrategy):
 
         # Бонус для AI-рекомендованных пар
         rec_bonus = 1 if pair in rec_pairs else 0
+        if pair in self.preferred_pairs:
+            rec_bonus += 1
+        is_nonpreferred = pair not in self.preferred_pairs and pair not in rec_pairs
 
         # Минимальный score: при conf=0.2→2, 0.4→3, 0.6→4
         min_score = max(1, min(6, int(1 + conf * 5)))
@@ -231,6 +268,21 @@ class AI_AdaptiveStrategy(IStrategy):
             (dataframe["trend_bull"] == 1) |
             (dataframe["close"] > dataframe["ema50"])
         )
+        strong_score_ok = dataframe["buy_score"] >= (min_score + 1 - rec_bonus)
+
+        # Не-приоритетные пары (не в preferred_pairs и не рекомендованы AI):
+        # требуем очень высокий score + сильный тренд + отсутствие волатильности.
+        # Это блокирует случайные входы в SOL/WIF/ETH.
+        if is_nonpreferred:
+            nonpref_entry = (
+                (dataframe["buy_score"] >= min_score + 2) &
+                trend_ok &
+                (dataframe["mom_bull"] == 1) &
+                (dataframe["adx"] > 25) &              # сильный тренд
+                (dataframe["atr_pct"] < 3.0) &          # низкая волатильность
+                (dataframe["vol_ok"] == 1) &
+                (dataframe["rsi"] >= 40) & (dataframe["rsi"] <= 70)
+            )
 
         if ai_signal == "buy":
             # === AI командует "покупать" — но проверяем качество ===
@@ -240,19 +292,20 @@ class AI_AdaptiveStrategy(IStrategy):
                 trend_ok &
                 (dataframe["mom_bull"] == 1) &
                 (dataframe["vol_ok"] == 1) &
-                (dataframe["rsi"] >= 35)
+                (dataframe["rsi"] >= 35) &
+                (dataframe["atr_ok"] == 1)
             )
 
         elif ai_signal == "hold" or regime_mult < 0.6:
-            # === Неопределённость — строгий вход ===
-            # Без уверенности AI не входим на слабых сигналах.
-            # Требуем: score + тренд + объём + RSI в норме.
+            # === Неопределённость — входим только при явном продолжении импульса ===
+            # В нейтральном рынке режем слабые сетапы: нужен запас по score и улучшение моментума.
             entry = (
-                score_ok &
+                strong_score_ok &
                 trend_ok &
+                (dataframe["macd_rising"] == 1) &
+                (dataframe["rsi_mom"] == 1) &
                 (dataframe["vol_ok"] == 1) &
-                (dataframe["rsi"] >= 35) &
-                (dataframe["rsi"] <= 70)
+                (dataframe["atr_ok"] == 1)
             )
         else:
             # === Без сигнала — стандартная логика ===
@@ -260,28 +313,35 @@ class AI_AdaptiveStrategy(IStrategy):
                 score_ok &
                 trend_ok &
                 (dataframe["mom_bull"] == 1) &
+                (dataframe["atr_ok"] == 1) &
                 (dataframe["vol_ok"] == 1)
             )
+
+        # Не-приоритетные пары: нужны более строгие условия входа.
+        # Без этого SOL/WIF/ETH проходят с weak score и дают -4-7%.
+        if is_nonpreferred:
+            entry = entry & nonpref_entry
 
         dataframe.loc[entry, "enter_long"] = 1
         return dataframe
 
     # ── ВЫХОД ──────────────────────────────────────────────────
     #
-    # AI НЕ управляет выходами.
     # Выходы управляются (в порядке приоритета):
-    #   1. custom_stoploss — подтягивает при профите 3%/5%/8%+
-    #   2. trailing_stop — фиксирует прибыль при падении с 8%+
+    #   1. custom_stoploss — подтягивает при профите
+    #   2. custom_exit — stale trade
     #   3. populate_exit_trend — RSI > 80 (перекупленность)
-    #   4. custom_exit — stale trade >5 дней
-    #   5. stoploss = -15% — только реальный обвал
+    #   4. stoploss = -5% — защита от обвала
     # ──────────────────────────────────────────────────────────
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["exit_long"] = 0
 
-        # Единственный тех-выход — перекупленность (редко для мемкоинов)
-        overbought = (dataframe["rsi"] > self.sell_rsi.value)
+        # Выходим при перекупленности только если импульс уже слабеет.
+        overbought = (
+            (dataframe["rsi"] > self.sell_rsi.value) &
+            (dataframe["rsi"] < dataframe["rsi"].shift(1))
+        )
 
         dataframe.loc[overbought, "exit_long"] = 1
         return dataframe
@@ -290,41 +350,57 @@ class AI_AdaptiveStrategy(IStrategy):
 
     def custom_stoploss(self, pair: str, trade, current_time, current_rate,
                         current_profit, **kwargs) -> float:
-        """Стоп-лосс: -15% первые 12ч, затем сужается.
-        
-        ВАЖНО: НЕ используем AI stoploss из ai_params.json!
-        ОН СЛИШКОМ ТУГОЙ (-3.5%) И РЕЖЕТ ВСЕ СДЕЛКИ.
-        Используем только собственные расчёты.
-        
-        Meme-coin'ы волатильны: -8..-12% это нормальный шум.
-        Даём сделке пространство в первый день. Если за 12ч
-        не восстановилась — начинаем сужать, чтобы не терять 
-        капитал в безнадёжных сделках.
-        
-        При прибыли — подтягиваем, но с запасом.
-        """
-        # ── Защита прибыли (приоритет 1) ──────────────────
-        if current_profit > 0.10:
-            return 0.005    # 10%+ → стоп в 0.5%
-        if current_profit > 0.08:
-            return 0.01     # 8%+ → стоп в 1%
-        if current_profit > 0.05:
-            return 0.02     # 5%+ → стоп в 2%
-        if current_profit > 0.03:
-            return 0.03     # 3%+ → стоп в 3% (от пика)
+        """Адаптивный стоп: режем убытки быстрее, победителям даём расти.
 
-        # ── Время: чем дольше сделка, тем жёстче стоп ────
+        Для прибыльных сделок используем stoploss_from_open, чтобы:
+        - фиксировать часть профита,
+        - не отдавать весь импульс назад,
+        - не выходить в минус после достигнутой прибыли.
+        """
+        # Защита прибыли: по мере роста профита подтягиваем floor от цены входа.
+        # После stale_trade при -4.5% стало ясно: нужно агрессивнее защищать прибыль
+        # и быстрее резать убытки на не-приоритетных парах.
+        if current_profit >= 0.08:
+            return stoploss_from_open(0.045, current_profit)
+        if current_profit >= 0.05:
+            return stoploss_from_open(0.025, current_profit)
+        if current_profit >= 0.03:
+            return stoploss_from_open(0.015, current_profit)
+        if current_profit >= 0.015:
+            return stoploss_from_open(0.003, current_profit)
+
+        # Базовый стоп. stoploss = -0.05 — жёсткий потолок.
+        # Для не-приоритетных пар сужаем быстрее, чтобы stale_trade не успел сработать.
+        base_stop = -0.045
+        is_preferred = pair in self.preferred_pairs
+
         if trade.open_date_utc:
             hours_open = (current_time - trade.open_date_utc).total_seconds() / 3600
-            if hours_open > 48:
-                return -0.03    # 2 дня → -3% (хватит ждать)
-            if hours_open > 24:
-                return -0.05    # 1 день → -5%
-            if hours_open > 12:
-                return -0.10    # 12ч → -10%
 
-        # ── Первые 12ч: широкий стоп ─────────────────────
-        return -0.15    # -15% — только реальный обвал
+            # === НЕПРИОРИТЕТНЫЕ ПАРЫ: выход быстрее ===
+            if not is_preferred:
+                # SOL -4.47%, WIF -3.89%, ETH -4.72% — все держались ~18ч.
+                # Не даём не-приоритетным парам доживать до 18ч в минусе.
+                if hours_open > 12 and current_profit < 0.0:
+                    return -0.02   # -2% — выходим, освобождаем капитал
+                if hours_open > 8 and current_profit < -0.015:
+                    return -0.025  # -2.5% — достаточно
+                if hours_open > 24:
+                    return -0.015  # -1.5% — stale trade принудительно
+                if hours_open > 12:
+                    return max(base_stop, -0.03)
+                if hours_open > 6:
+                    return max(base_stop, -0.04)
+
+            # === ПРИОРИТЕТНЫЕ ПАРЫ: даём больше времени ===
+            if hours_open > 48:
+                return max(base_stop, -0.025)
+            if hours_open > 24:
+                return max(base_stop, -0.035)
+            if hours_open > 12 and current_profit < -0.01:
+                return max(base_stop, -0.04)
+
+        return base_stop
 
     def custom_stake_amount(self, pair: str, current_time, current_rate,
                             proposed_stake, min_stake, max_stake, leverage,
@@ -371,21 +447,65 @@ class AI_AdaptiveStrategy(IStrategy):
         except Exception:
             pass
 
-        return proposed_stake * ai_size * regime_factor
+        stake = proposed_stake * ai_size * regime_factor
+
+        # Второстепенные пары: минимальный размер, чтобы убыток не съедал профит.
+        # PEOPLE даёт +2-4%, а SOL/WIF/ETH убивают -4-7% при полном размере.
+        # Снижаем до 20%, чтобы даже -5% на не-приоритетной паре = -1% от капитала.
+        if pair not in self.preferred_pairs:
+            stake = min(stake, proposed_stake * 0.20)
+
+        return stake
 
     def custom_exit(self, pair: str, trade, current_time, current_rate,
                     current_profit, **kwargs) -> str | None:
         """Выход застаревших сделок — освобождаем капитал.
         
-        custom_stoploss уже сужает стоп до -3% к 48ч.
-        Этот exit — последняя страховка: если стоп-лосс не сработал
-        (например из-за гэпа), форсируем выход.
+        stale_trade убивает капитал: SOL -4.47%, WIF -3.89%, ETH -4.72%.
+        Все не-приоритетные пары держались ~18ч до выхода.
+        Решение: не-приоритетные пары выходят в 2-3x быстрее.
         """
-        if trade.open_date_utc:
-            days_open = (current_time - trade.open_date_utc).days
-            # 5 дней — любые сделки закрываем
-            if days_open >= 5 and current_profit < 0.02:
+        if not trade.open_date_utc:
+            return None
+
+        hours_open = (current_time - trade.open_date_utc).total_seconds() / 3600
+        days_open = hours_open / 24
+        is_preferred = pair in self.preferred_pairs
+        
+        # Адаптируем порог выхода к режиму рынка
+        regime_mult = self._get_regime_multiplier()
+        
+        # === НЕ-ПРИОРИТЕТНЫЕ ПАРЫ: агрессивный выход ===
+        # SOL/WIF/ETH показали: 18ч в минусе → -4.5%.
+        # Не даём им столько времени.
+        if not is_preferred:
+            # Любой убыток >8ч → выход
+            if hours_open >= 8 and current_profit < 0.0:
+                return "stale_trade_nonpref"
+            # Даже в плюсе, но нет движения 24ч → выход
+            if hours_open >= 24 and current_profit < 0.01:
+                return "stale_trade_nonpref_flat"
+            # 3+ дня → выход принудительно
+            if hours_open >= 72:
+                return "stale_trade_nonpref_aged"
+        
+        # === ПРИОРИТЕТНЫЕ ПАРЫ ===
+        # PEOPLE даёт стабильный результат — даём больше времени
+        if regime_mult < 0.6:
+            # Нейтральность/паника: не держим минус на приоритетных
+            if hours_open >= 16 and current_profit < 0.002:
+                return "stale_trade_neutral"
+            if hours_open >= 24 and current_profit < -0.01:
+                return "stale_trade_neutral"
+        else:
+            # Бычий режим: больше терпения
+            if days_open >= 3 and current_profit <= -0.015:
                 return "stale_trade"
+            if days_open >= 5 and current_profit < 0.005:
+                return "stale_trade"
+            if days_open >= 7 and current_profit < 0.0:
+                return "stale_trade_timeout"
+        
         return None
 
     def adjust_entry_price(self, trade, order, pair, current_time, proposed_rate, current_order_rate, entry_tag=None):
