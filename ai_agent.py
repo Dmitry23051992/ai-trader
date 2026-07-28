@@ -72,8 +72,12 @@ def api_get(path: str) -> dict:
         return {}
 
 
-def ollama_chat(prompt: str, system: str = "") -> str:
-    """Отправить промпт в Ollama, вернуть текст ответа."""
+def ollama_chat(prompt: str, system: str = "", request_timeout: int = 120) -> str:
+    """Отправить промпт в Ollama, вернуть текст ответа.
+    
+    Args:
+        request_timeout: таймаут в секундах. Совет директоров: 45с, single LLM: 120с.
+    """
     import urllib.request as req
     import json as j
 
@@ -84,9 +88,9 @@ def ollama_chat(prompt: str, system: str = "") -> str:
         "stream": False,
         "options": {
             "temperature": 0.2,
-            "num_predict": 128,
-            "top_k": 20,
-            "top_p": 0.80,
+            "num_predict": 64,
+            "top_k": 15,
+            "top_p": 0.75,
         }
     }
     data = j.dumps(payload).encode()
@@ -97,7 +101,7 @@ def ollama_chat(prompt: str, system: str = "") -> str:
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with req.urlopen(r, timeout=60) as resp:
+        with req.urlopen(r, timeout=request_timeout) as resp:
             result = j.loads(resp.read())
             return result.get("response", "").strip()
     except Exception as e:
@@ -816,7 +820,7 @@ def ollama_council(market_summary: str, full_context: str, feedback: str = "", m
         full_system = persona_system + "\n\n" + full_context
 
         log(f"  Consulting {persona['name']}...")
-        response = ollama_chat(market_summary, system=full_system)
+        response = ollama_chat(market_summary, system=full_system, request_timeout=45)
 
         if response:
             parsed = _parse_llm_json(response)
@@ -829,6 +833,13 @@ def ollama_council(market_summary: str, full_context: str, feedback: str = "", m
                 log(f"    ⚠️  {persona['name']}: could not parse JSON response")
         else:
             log(f"    ⚠️  {persona['name']}: no response")
+
+        # Ранний выход: если 2 советника не ответили, остальных не ждём
+        failed = (i + 1) - len(responses)
+        remaining = len(personas) - (i + 1)
+        if failed >= 2 and remaining > 0:
+            log(f"    ⏭️  {failed} advisors failed, skipping remaining {remaining}")
+            break
 
     if not responses:
         log("⚠️  Council returned no valid responses — falling back to single LLM")
