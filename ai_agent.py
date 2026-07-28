@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ── Конфигурация ─────────────────────────────────────────────
@@ -394,16 +394,49 @@ def evaluate_decision_log() -> dict:
     if not recent:
         return {}
 
-    # Получаем закрытые сделки
-    trades_data = api_get("/api/v1/trades?limit=100") or {"trades": []}
-    closed_trades = [t for t in trades_data.get("trades", []) if not t.get("is_open", True)]
+    # Получаем закрытые сделки.
+    # API Freqtrade возвращает сделки по возрастанию (старые первые).
+    # Пагинируем с offset, пока не дойдём до свежих сделок (максимум 10 страниц)
+    all_trades = []
+    offset = 0
+    PAGE_SIZE = 100
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=14)).strftime("%Y-%m-%d")
+    
+    while offset < PAGE_SIZE * 10:
+        trades_data = api_get(f"/api/v1/trades?limit={PAGE_SIZE}&offset={offset}") or {"trades": []}
+        page = trades_data.get("trades", [])
+        if not page:
+            break
+        all_trades.extend(page)
+        
+        # Проверяем, есть ли сделки за последние 14 дней
+        last_date = page[-1].get("open_date", "")
+        if last_date and last_date[:10] >= cutoff_date:
+            # Добавляем ещё одну страницу для запаса
+            more = api_get(f"/api/v1/trades?limit={PAGE_SIZE}&offset={offset + PAGE_SIZE}") or {"trades": []}
+            all_trades.extend(more.get("trades", []))
+            break
+        
+        offset += PAGE_SIZE
+        
+    closed_trades = [t for t in all_trades if not t.get("is_open", True)]
 
     # Сопоставляем: для каждой закрытой сделки находим решение AI,
     # которое было активно на момент входа
     matched_trades = []
     for trade in closed_trades:
-        open_ts = _parse_dt(trade.get("open_date", ""))
+        # Freqtrade может отдавать open_date (строка) или open_timestamp (unix)
+        raw_date = trade.get("open_date", "")
+        raw_ts = trade.get("open_timestamp")
+        open_ts = _parse_dt(raw_date) if raw_date else None
+        if open_ts is None and raw_ts is not None:
+            try:
+                open_ts = float(raw_ts) / 1000  # может быть в миллисекундах
+            except (ValueError, TypeError):
+                pass
         if open_ts is None:
+            log(f"⚠️  Cannot parse open_date for trade {trade.get('trade_id', '?')}: "
+                f"'{raw_date}' ts={raw_ts}")
             continue
 
         # Ищем решение, принятое незадолго до входа в сделку (в пределах 6 часов)
@@ -695,21 +728,23 @@ def _aggregate_council_votes(responses: list[dict], market_data: dict = None) ->
     # --- РАЗМЕР ПОЗИЦИИ (position_size_pct) ---
     # LLM часто говорит 0.8-1.0 даже при просадке.
     # Используем жёсткую математику:
-    if total_profit_pct < -10:
+    if total_profit_pct < -15:
         pos_size = 0.0  # STOP! Massive drawdown
+    elif total_profit_pct < -10:
+        pos_size = 0.15  # Глубокая просадка — только PEOPLE-подобные
     elif total_profit_pct < -5:
-        pos_size = 0.2  # Серьёзная просадка — минимальная активность
+        pos_size = 0.25  # Серьёзная просадка
     elif total_profit_pct < -2:
-        pos_size = 0.4  # Умеренная просадка
+        pos_size = 0.40  # Умеренная просадка
     elif final_regime in ("panic",):
-        pos_size = 0.1
+        pos_size = 0.15
     elif final_regime == "bearish":
-        pos_size = max(0.2, min(0.5, winrate / 200))
+        pos_size = max(0.20, min(0.50, winrate / 200))
     elif final_regime == "neutral":
         # winrate < 40% → 0.3, winrate > 60% → 0.7
-        pos_size = max(0.2, min(0.7, winrate / 100))
+        pos_size = max(0.25, min(0.70, winrate / 100))
     else:  # bullish
-        pos_size = max(0.4, min(1.0, winrate / 80))
+        pos_size = max(0.40, min(1.0, winrate / 80))
 
     # Если worst_loss > 5% → уменьшаем ещё
     if worst_loss < -6:
@@ -1048,18 +1083,20 @@ def update_ai_params(llm_response: str, market_data: dict) -> bool:
             worst_loss = min(losses) if losses else -5.0
 
         # Размер позиции от 0.0 (стоп) до 1.0 (полный)
-        if total_profit_pct < -10:
+        if total_profit_pct < -15:
             pos_size = 0.0
+        elif total_profit_pct < -10:
+            pos_size = 0.15
         elif total_profit_pct < -5:
-            pos_size = 0.2 + 0.3 * ((total_profit_pct + 10) / 5)  # 0.2 → 0.5 линейно
+            pos_size = 0.25
         elif total_profit_pct < -2:
-            pos_size = 0.4
+            pos_size = 0.40
         elif regime == "panic":
-            pos_size = 0.1
+            pos_size = 0.15
         elif regime == "bearish":
-            pos_size = max(0.2, min(0.5, winrate / 200))
+            pos_size = max(0.20, min(0.50, winrate / 200))
         elif regime == "neutral":
-            pos_size = max(0.2, min(0.7, winrate / 100))
+            pos_size = max(0.25, min(0.70, winrate / 100))
         else:  # bullish
             pos_size = max(0.4, min(1.0, winrate / 80))
 
