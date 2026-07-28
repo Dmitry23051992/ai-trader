@@ -84,9 +84,9 @@ def ollama_chat(prompt: str, system: str = "") -> str:
         "stream": False,
         "options": {
             "temperature": 0.2,
-            "num_predict": 384,
-            "top_k": 30,
-            "top_p": 0.85,
+            "num_predict": 128,
+            "top_k": 20,
+            "top_p": 0.80,
         }
     }
     data = j.dumps(payload).encode()
@@ -97,12 +97,34 @@ def ollama_chat(prompt: str, system: str = "") -> str:
             headers={"Content-Type": "application/json"},
             method="POST"
         )
-        with req.urlopen(r, timeout=180) as resp:
+        with req.urlopen(r, timeout=60) as resp:
             result = j.loads(resp.read())
             return result.get("response", "").strip()
     except Exception as e:
         log(f"Ollama Error: {e}")
         return ""
+
+
+def _parse_dt(s: str) -> float | None:
+    """Парсит дату из Freqtrade или лога в Unix timestamp.
+    
+    Freqtrade возвращает '2026-07-28 01:15:04' (с пробелом вместо T).
+    Лог решений хранит '2026-07-28T15:10:13.446508' (ISO с T).
+    """
+    if not s:
+        return None
+    # Freqtrade: "2026-07-28 01:15:04" → "2026-07-28T01:15:04"
+    normalized = s.replace(" ", "T").replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S%z",
+                     "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f%z"):
+            try:
+                return datetime.strptime(normalized.split("+")[0].split("Z")[0], fmt).timestamp()
+            except ValueError:
+                continue
+    return None
 
 
 # ── Свечные данные с Binance ──────────────────────────────
@@ -361,12 +383,9 @@ def evaluate_decision_log() -> dict:
     cutoff = time.time() - MAX_HISTORY_DAYS * 86400
     recent = []
     for d in decisions:
-        try:
-            ts = datetime.fromisoformat(d["timestamp"]).timestamp()
-            if ts >= cutoff:
-                recent.append(d)
-        except Exception:
-            continue
+        ts = _parse_dt(d.get("timestamp", ""))
+        if ts is not None and ts >= cutoff:
+            recent.append(d)
 
     if not recent:
         return {}
@@ -379,23 +398,21 @@ def evaluate_decision_log() -> dict:
     # которое было активно на момент входа
     matched_trades = []
     for trade in closed_trades:
-        try:
-            open_timestamp = datetime.fromisoformat(trade["open_date"].replace("Z", "+00:00")).timestamp()
-        except Exception:
+        open_ts = _parse_dt(trade.get("open_date", ""))
+        if open_ts is None:
             continue
 
         # Ищем решение, принятое незадолго до входа в сделку (в пределах 6 часов)
         best_decision = None
         best_diff = float("inf")
         for d in recent:
-            try:
-                dt = datetime.fromisoformat(d["timestamp"]).timestamp()
-                diff = open_timestamp - dt
-                if 0 <= diff <= 6 * 3600 and diff < best_diff:
-                    best_decision = d
-                    best_diff = diff
-            except Exception:
+            dt = _parse_dt(d.get("timestamp", ""))
+            if dt is None:
                 continue
+            diff = open_ts - dt
+            if 0 <= diff <= 6 * 3600 and diff < best_diff:
+                best_decision = d
+                best_diff = diff
 
         if best_decision:
             matched_trades.append({
