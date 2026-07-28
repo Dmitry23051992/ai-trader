@@ -606,20 +606,22 @@ def _council_persona(name: str, instruction: str) -> str:
 {{
   "market_regime": "bullish" | "neutral" | "bearish" | "panic",
   "ai_signal": "buy" | "sell" | "hold",
-  "confidence_threshold": 0.0-1.0,
-  "position_size_pct": 0.0-1.0,
-  "stoploss_recommendation": -0.01 to -0.08,
+  "recommended_pairs": ["PAIR/USDT"],
   "reasoning": "твоё обоснование (1 предложение)"
 }}"""
 
 
-def _aggregate_council_votes(responses: list[dict]) -> dict:
+def _aggregate_council_votes(responses: list[dict], market_data: dict = None) -> dict:
     """Усреднить голоса совета в единую рекомендацию.
 
     Использует взвешенное голосование:
     - buy = +1, hold = 0, sell = -1
     - regime: числовое представление + усреднение
     - position_size, confidence, stoploss: медианное значение
+
+    ⚠️ ВАЖНО: LLM не умеет считать арифметику (размер позиции, риск).
+    Поэтому position_size и confidence пересчитываются математически
+    на основе фактической производительности, а голос LLM — только направление.
     """
     if not responses:
         return {}
@@ -636,9 +638,6 @@ def _aggregate_council_votes(responses: list[dict]) -> dict:
         sig = r.get("ai_signal", "hold")
         votes.append(signal_map.get(sig, 0))
 
-        reg = r.get("market_regime", "neutral")
-        regime_scores.setdefault(reg, 0)
-
     avg_vote = sum(votes) / len(votes)
     final_signal = inv_signal.get(1 if avg_vote > 0.3 else (-1 if avg_vote < -0.3 else 0), "hold")
 
@@ -652,14 +651,79 @@ def _aggregate_council_votes(responses: list[dict]) -> dict:
     final_regime = min(inv_regime.keys(), key=lambda k: abs(k - avg_reg))
     final_regime = inv_regime[final_regime]
 
-    # Медианные/средние значения
-    sizes = [float(r.get("position_size_pct", 0.5)) for r in responses if r.get("position_size_pct") is not None]
-    confs = [float(r.get("confidence_threshold", 0.5)) for r in responses if r.get("confidence_threshold") is not None]
-    sls = [float(r.get("stoploss_recommendation", -0.035)) for r in responses if r.get("stoploss_recommendation") is not None]
+    # ── МАТЕМАТИКА ПОВЕРХ LLM ──────────────────────────────
+    # LLM не умеет считать position_size/confidence.
+    # Вычисляем их на основе фактических данных рынка.
+    
+    # Извлекаем метрики из market_data, если есть
+    total_profit_pct = 0.0
+    winrate = 50.0
+    worst_loss = -5.0
+    open_trades_count = 0
+    if market_data:
+        total_profit_pct = market_data.get("balance", {}).get("profit_pct", 0)
+        open_trades_count = len(market_data.get("open_trades", []))
+        # Вычисляем winrate из закрытых сделок
+        closed = market_data.get("closed_trades", [])
+        if closed:
+            wins = sum(1 for t in closed if t.get("profit_pct", 0) > 0)
+            winrate = wins / len(closed) * 100 if len(closed) > 0 else 50
+            losses = [t.get("profit_pct", 0) for t in closed if t.get("profit_pct", 0) < 0]
+            worst_loss = min(losses) if losses else -5.0
 
-    def median(arr):
-        s = sorted(arr)
-        return s[len(s) // 2] if s else 0.5
+    # --- РАЗМЕР ПОЗИЦИИ (position_size_pct) ---
+    # LLM часто говорит 0.8-1.0 даже при просадке.
+    # Используем жёсткую математику:
+    if total_profit_pct < -10:
+        pos_size = 0.0  # STOP! Massive drawdown
+    elif total_profit_pct < -5:
+        pos_size = 0.2  # Серьёзная просадка — минимальная активность
+    elif total_profit_pct < -2:
+        pos_size = 0.4  # Умеренная просадка
+    elif final_regime in ("panic",):
+        pos_size = 0.1
+    elif final_regime == "bearish":
+        pos_size = max(0.2, min(0.5, winrate / 200))
+    elif final_regime == "neutral":
+        # winrate < 40% → 0.3, winrate > 60% → 0.7
+        pos_size = max(0.2, min(0.7, winrate / 100))
+    else:  # bullish
+        pos_size = max(0.4, min(1.0, winrate / 80))
+
+    # Если worst_loss > 5% → уменьшаем ещё
+    if worst_loss < -6:
+        pos_size *= 0.5
+    pos_size = max(0.0, min(1.0, pos_size))
+
+    # --- УВЕРЕННОСТЬ (confidence_threshold) ---
+    # LLM часто ставит 0.2-0.4, что даёт слишком много входов.
+    # Математика: чем выше winrate, тем ниже confidence (больше входов).
+    # Чем ниже winrate, тем выше confidence (меньше, но качественнее входы).
+    if total_profit_pct < -5:
+        conf = 0.75  # Очень строгий отбор
+    elif winrate < 35:
+        conf = 0.70  # Строгий — меньше входов, выше качество
+    elif winrate < 50:
+        conf = 0.60
+    elif winrate < 65:
+        conf = 0.50
+    else:
+        conf = 0.40  # Можно больше входов, система в плюсе
+    
+    # Режимная корректировка confidence
+    regime_conf_adj = {"panic": +0.20, "bearish": +0.10, "neutral": 0.0, "bullish": -0.10}
+    conf += regime_conf_adj.get(final_regime, 0)
+    conf = max(0.30, min(0.85, conf))
+
+    # --- СТОП-ЛОСС ---
+    # LLM: -0.02..-0.08. Математика: worst_loss * 1.2 + запас
+    if final_regime == "panic":
+        sl = -0.035  # Тайт в панике
+    elif worst_loss < -7:
+        sl = -0.05   # Расширяем для волатильных
+    else:
+        sl = max(-0.06, min(-0.035, worst_loss * 0.01 * 1.3))
+    sl = round(max(-0.08, min(-0.02, sl)), 3)
 
     # Собираем аргументы для отчёта
     all_reasoning = []
@@ -668,12 +732,18 @@ def _aggregate_council_votes(responses: list[dict]) -> dict:
         if reason:
             all_reasoning.append(f"Советник {i+1}: {reason}")
 
+    math_note = (
+        f"[МАТЕМАТИКА] pos_size={pos_size:.2f} (winrate={winrate:.0f}%, "
+        f"P&L={total_profit_pct:+.1f}%), conf={conf:.2f}, sl={sl:.3f}"
+    )
+    all_reasoning.append(math_note)
+
     return {
         "market_regime": final_regime,
         "ai_signal": final_signal,
-        "position_size_pct": max(0.5, min(1.0, median(sizes))),
-        "confidence_threshold": max(0.2, min(0.6, median(confs))),
-        "stoploss_recommendation": max(-0.08, min(-0.01, median(sls))),
+        "position_size_pct": pos_size,
+        "confidence_threshold": conf,
+        "stoploss_recommendation": sl,
         "reasoning": " | ".join(all_reasoning) if all_reasoning else "Консенсус совета директоров",
         "_votes": {
             "buy": sum(1 for v in votes if v == 1),
@@ -684,7 +754,7 @@ def _aggregate_council_votes(responses: list[dict]) -> dict:
     }
 
 
-def ollama_council(market_summary: str, full_context: str, feedback: str = "") -> dict:
+def ollama_council(market_summary: str, full_context: str, feedback: str = "", market_data: dict = None) -> dict:
     """Запустить совет директоров: несколько LLM-запросов с разными ролями.
 
     Args:
@@ -748,7 +818,7 @@ def ollama_council(market_summary: str, full_context: str, feedback: str = "") -
         response = ollama_chat(market_summary, system=full_context)
         return _parse_llm_json(response) or {}
 
-    aggregated = _aggregate_council_votes(responses)
+    aggregated = _aggregate_council_votes(responses, market_data)
     log(f"🏛️  Council consensus: signal={aggregated.get('ai_signal')}, "
         f"regime={aggregated.get('market_regime')}, "
         f"votes={aggregated.get('_votes', {})}")
@@ -778,17 +848,16 @@ def build_market_prompt(data: dict, candle_data: dict = None, feedback: str = ""
 {
   "market_regime": "bullish" | "neutral" | "bearish" | "panic",
   "reasoning": "кратко почему такой режим (1-2 предложения)",
-  "stoploss_recommendation": -0.035,
-  "position_size_pct": 0.0-1.0,
-  "confidence_threshold": 0.0-1.0,
+  "ai_signal": "buy" | "sell" | "hold",
   "recommended_pairs": ["BTC/USDT", ...],
   "avoid_pairs": [],
-  "action": "increase" | "reduce" | "hold",
-  "ai_signal": "buy" | "sell" | "hold"
+  "action": "increase" | "reduce" | "hold"
 }
 
-ВАЖНО: Ты должен рекомендовать АКТИВНУЮ торговлю. Если рынок нейтральный или бычий — ставь position_size_pct = 0.8-1.0 и confidence_threshold = 0.3-0.5.
-Не будь слишком консервативным! Торговля должна идти.
+ВАЖНО: Ты отвечаешь ТОЛЬКО за НАПРАВЛЕНИЕ (signal, regime, recommended_pairs).
+Числовые параметры (position_size_pct, confidence_threshold, stoploss_recommendation)
+вычисляются математически на основе твоего направления и фактической статистики.
+Не включай их в JSON — они будут проигнорированы.
 
 Правила:
 - ai_signal="buy": рынок располагает к покупкам, стратегия должна входить
@@ -807,9 +876,8 @@ def build_market_prompt(data: dict, candle_data: dict = None, feedback: str = ""
 ЗАПОМНИ: Паниковать и продавать — самая частая причина потери денег.
 Если рынок идёт вниз — лучше hold (не входить), чем sell (выходить в минус).
 
-stoploss_recommendation: от -0.02 до -0.05
-position_size_pct: от 0.5 до 1.0 (НЕ ставь меньше 0.5!)
-confidence_threshold: от 0.2 до 0.6 (ниже = больше входов, НЕ ставь выше 0.6!)
+Числовые параметры (position_size, confidence, stoploss) вычисляются автоматически
+на основе твоих рекомендаций и фактической статистики — не думай о них.
 
 Теперь у тебя есть СВЕЧНЫЕ ДАННЫЕ (OHLCV) с Binance за последние 12 часов.
 Анализируй их:
@@ -884,11 +952,16 @@ confidence_threshold: от 0.2 до 0.6 (ниже = больше входов, �
 # ── Обновление ai_params.json ────────────────────────────────
 
 def update_ai_params(llm_response: str, market_data: dict) -> bool:
-    """Распарсить ответ LLM и обновить ai_params.json."""
+    """Распарсить ответ LLM и обновить ai_params.json.
+
+    ⚠️ LLM не умеет считать арифметику.
+    Извлекаем только НАПРАВЛЕНИЕ (signal, regime, pairs) из ответа LLM,
+    а числовые параметры (position_size, confidence, stoploss) вычисляем
+    математически на основе market_data.
+    """
     try:
         # Извлекаем JSON из ответа
         text = llm_response.strip()
-        # Ищем JSON в ответе (между { и })
         start = text.find("{")
         end = text.rfind("}") + 1
         if start >= 0 and end > start:
@@ -912,21 +985,10 @@ def update_ai_params(llm_response: str, market_data: dict) -> bool:
                 "_version": 2,
             }
 
-        # Обновляем из рекомендации (с защитой от консервативных значений)
+        # ── 1. ИЗВЛЕКАЕМ НАПРАВЛЕНИЕ ИЗ LLM ────────────────
+        # Только тренд, режим, пары — то, в чём LLM сильна
         if "market_regime" in rec:
             params["market_regime"] = rec["market_regime"]
-        if "stoploss_recommendation" in rec:
-            params["stoploss"] = max(-0.08, min(-0.01, float(rec["stoploss_recommendation"])))
-        if "position_size_pct" in rec:
-            # Не даём ставить меньше 50% — иначе смысла нет
-            params["position_size_pct"] = max(0.5, min(1.0, float(rec["position_size_pct"])))
-        if "confidence_threshold" in rec:
-            # Не даём ставить выше 0.6 — иначе входов не будет
-            params["confidence_threshold"] = max(0.2, min(0.6, float(rec["confidence_threshold"])))
-        if "reasoning" in rec:
-            params["reasoning"] = rec["reasoning"]
-
-        # AI-сигнал для прямого управления стратегией
         if "ai_signal" in rec:
             allowed_signals = {"buy", "sell", "hold"}
             if rec["ai_signal"] in allowed_signals:
@@ -937,6 +999,77 @@ def update_ai_params(llm_response: str, market_data: dict) -> bool:
             params["avoid_pairs"] = rec["avoid_pairs"]
         if "action" in rec:
             params["action"] = rec["action"]
+        if "reasoning" in rec:
+            params["reasoning"] = rec["reasoning"]
+
+        # ── 2. МАТЕМАТИКА ПОВЕРХ LLM ───────────────────────
+        # Арифметика: размер позиции, уверенность, стоп-лосс.
+        # LLM не умеет это считать — вычисляем сами.
+        regime = params.get("market_regime", "neutral")
+        total_profit_pct = market_data.get("balance", {}).get("profit_pct", 0) if market_data else 0
+        closed_trades = market_data.get("closed_trades", []) if market_data else []
+        open_trades_count = len(market_data.get("open_trades", [])) if market_data else 0
+
+        winrate = 50.0
+        worst_loss = -5.0
+        if closed_trades:
+            n = len(closed_trades)
+            wins = sum(1 for t in closed_trades if t.get("profit_pct", 0) > 0)
+            winrate = wins / n * 100 if n > 0 else 50
+            losses = [t.get("profit_pct", 0) for t in closed_trades if t.get("profit_pct", 0) < 0]
+            worst_loss = min(losses) if losses else -5.0
+
+        # Размер позиции от 0.0 (стоп) до 1.0 (полный)
+        if total_profit_pct < -10:
+            pos_size = 0.0
+        elif total_profit_pct < -5:
+            pos_size = 0.2 + 0.3 * ((total_profit_pct + 10) / 5)  # 0.2 → 0.5 линейно
+        elif total_profit_pct < -2:
+            pos_size = 0.4
+        elif regime == "panic":
+            pos_size = 0.1
+        elif regime == "bearish":
+            pos_size = max(0.2, min(0.5, winrate / 200))
+        elif regime == "neutral":
+            pos_size = max(0.2, min(0.7, winrate / 100))
+        else:  # bullish
+            pos_size = max(0.4, min(1.0, winrate / 80))
+
+        # Если были сильные убытки — сокращаем ещё
+        if worst_loss < -6:
+            pos_size *= 0.6
+        elif worst_loss < -4:
+            pos_size *= 0.8
+        params["position_size_pct"] = max(0.0, min(1.0, pos_size))
+
+        # Уверенность (confidence_threshold): чем выше winrate, тем ниже (больше входов)
+        if total_profit_pct < -5:
+            conf = 0.75
+        elif winrate < 30:
+            conf = 0.75
+        elif winrate < 45:
+            conf = 0.65
+        elif winrate < 60:
+            conf = 0.55
+        else:
+            conf = 0.40
+
+        regime_conf = {"panic": +0.15, "bearish": +0.10, "neutral": 0.0, "bullish": -0.10}
+        conf += regime_conf.get(regime, 0)
+        params["confidence_threshold"] = max(0.30, min(0.85, conf))
+
+        # Стоп-лосс: на основе худшего убытка + запас
+        if regime == "panic":
+            sl = -0.035
+        elif worst_loss < -7:
+            sl = -0.05
+        elif worst_loss < -4:
+            sl = max(-0.06, worst_loss * 0.01 * 1.3)
+        else:
+            sl = -0.04
+        params["stoploss"] = max(-0.08, min(-0.02, round(sl, 3)))
+
+        params["_math_version"] = 2
 
         # Сохраняем результаты голосования совета (если есть)
         if "_votes" in rec:
@@ -945,7 +1078,7 @@ def update_ai_params(llm_response: str, market_data: dict) -> bool:
             params["_council_persona"] = rec["_persona"]
 
         params["_updated_at"] = datetime.now().isoformat()
-        params["_version"] = 5
+        params["_version"] = 6
 
         with open(AI_PARAMS_PATH, "w") as f:
             json.dump(params, f, indent=2)
@@ -1005,7 +1138,7 @@ def run_analysis():
     # ── Multi-LLM Совет Директоров ─────────────────────────
     if USE_COUNCIL:
         log("🏛️  Convening AI trading council...")
-        council_result = ollama_council(market_summary, system_prompt, feedback)
+        council_result = ollama_council(market_summary, system_prompt, feedback, data)
 
         if council_result:
             # Сериализуем результат совета в JSON для update_ai_params
